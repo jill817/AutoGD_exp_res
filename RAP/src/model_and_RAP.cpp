@@ -7,14 +7,14 @@
 #include <sys/types.h>
 
 
-void solve(std::string format_supply_path, std::string demand_path, std::string heat_path,std::string lp_path,solver::ModelMode mode,int time_limit,std::string output_base)
+void solve(std::string format_supply_path, std::string demand_path, std::string heat_path,std::string lp_path,solver::ModelMode mode,int time_limit,std::string output_base, int online_top_k)
 {
     int nia_num=100;
     solver::sls_model m_model(format_supply_path, demand_path, heat_path);
     std::cout<<"start solve"<<std::endl;
     m_model.solve_problem(lp_path, output_base,
                             nia_num, 
-                            "experiment/" + std::to_string(nia_num) + ".res", mode,time_limit);
+                            "experiment/" + std::to_string(nia_num) + ".res", mode,time_limit, online_top_k);
 }
 
 
@@ -37,7 +37,8 @@ int main(int argc, char *argv[])
     int time_limit=60;
 
     std::string lp_path = output_base + "_model.lp";
-    solve(supply_filename, demand_filename, heat_file, lp_path, mode, time_limit,output_base);
+    int online_top_k = 50;
+    solve(supply_filename, demand_filename, heat_file, lp_path, mode, time_limit,output_base, online_top_k);
 
     return 0;
 }

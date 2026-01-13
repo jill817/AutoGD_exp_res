@@ -41,16 +41,25 @@ namespace solver
         }
     }
 
-    sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set) : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set) {}
+        sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set, size_t tail_keep_)
+            : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set),
+                tail_keep(tail_keep_),
+                last_valid_demand_idx(-1), last_valid_demand_id(""),
+                origin_gain_online(0), unsatisfied_total(0), penalty(0.0), gain_metric(0.0) {}
 
-    void sls_model::solve_problem(std::string allocation_res_file,ModelMode mode, std::vector<std::string> online_query_list)
+    void sls_model::solve_problem(std::string allocation_res_file, ModelMode mode, int cutoff_seconds)
     {
         std::cout << std::endl;
         read_supply_data(); // 内部已经包含两次过滤逻辑：先预加载demand，再过滤supply
         read_demand_data(); // 后读取 demand 文件
         read_heat_data();
         std::cout << std::endl;
-        model_problem(allocation_res_file, mode, online_query_list);
+        origin_gain_online = 0;
+        unsatisfied_total = 0;
+        penalty = 0.0;
+        gain_metric = 0.0;
+        model_problem(allocation_res_file, mode, cutoff_seconds);
+        // std::cout << "solve_problem 调用完成，未析构"<<std::endl;
     }
 
     void sls_model::read_demand_data()
@@ -59,9 +68,17 @@ namespace solver
         did_amount.resize(did_index.size(), 0); 
         did_remain_amount.clear();
         did_remain_amount.resize(did_index.size(), 0);
+        last_valid_demand_idx = -1;
+        last_valid_demand_id.clear();
+        last_online_list.clear();
+        last_online_idlist.clear();
 
         std::ifstream demand_file(demand_path);
         std::string record;
+
+        // 记录所有在 supply 过滤集合中的需求出现顺序，便于截取末尾 N 个
+        std::vector<int> valid_order_idx;
+        std::vector<std::string> valid_order_id;
 
         int line_num = 0;
         int valid_matched_demands = 0;  // 既在supply又在demand中的需求数量
@@ -80,11 +97,26 @@ namespace solver
                 did_amount[demand_idx] = amount; // 更新对应索引的需求量
                 did_remain_amount[demand_idx] = amount; // 初始化剩余需求量
                 valid_matched_demands++;
+                valid_order_idx.push_back(demand_idx);
+                valid_order_id.push_back(demand_id);
+                // record the last valid demand that also exists in supply-filtered set
+                last_valid_demand_idx = demand_idx;
+                last_valid_demand_id = demand_id;
             }
             line_num++;
         }
 
+        // 保留末尾最多 tail_keep 个有效需求（按文件出现顺序）
+        if (!valid_order_idx.empty()) {
+            size_t start = (valid_order_idx.size() > tail_keep) ? (valid_order_idx.size() - tail_keep) : 0;
+            for (size_t i = start; i < valid_order_idx.size(); ++i) {
+                last_online_list.push_back(valid_order_idx[i]);
+                last_online_idlist.push_back(valid_order_id[i]);
+            }
+        }
+
         std::cout << "Valid demand count (both in supply and demand): " << valid_matched_demands << std::endl;
+        std::cout << "Online demand tail size (<=50): " << last_online_list.size() << std::endl;
         
         // 检查是否有在supply中但不在demand文件中的需求
         if (valid_matched_demands < (int)did_index.size()) {
@@ -288,7 +320,7 @@ namespace solver
     }
 
 
-    void sls_model::model_problem(std::string allocation_res_file,ModelMode mode, std::vector<std::string> online_query_list)
+    void sls_model::model_problem(std::string allocation_res_file, ModelMode mode, int cutoff_seconds)
     {
         std::cout << "supply num | demand num\n";
         std::cout << sid_pv.size() << " | " << did_amount.size() << std::endl;
@@ -297,21 +329,49 @@ namespace solver
         {
             auto start_time = std::chrono::high_resolution_clock::now();
 
-            LocalSearch(allocation_res_file, mode, online_query_list);
+            LocalSearch(allocation_res_file, mode);
 
             // local search 结束时间
             auto end_time = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
             std::cout << "Local search function execution time: " << duration << " ms" << std::endl;
+            // 在线阶段：读取在线需求、FIFO分配、输出在线结果（包含离线+在线）
+            std::string online_allocation_res_file = allocation_res_file + "_online.csv";
+            mark_fixed_online_demand();
+            FIFO_online(cutoff_seconds);
+            LSout_online(online_allocation_res_file);
+
+            // compute online metrics (gain/penalty) and print
+            unsatisfied_total = 0;
+            for (int rem : did_remain_amount) {
+                unsatisfied_total += rem;
+            }
+            penalty = static_cast<double>(unsatisfied_total) * 1000;
+            gain_metric = static_cast<double>(origin_gain_online) - penalty;
+            std::cout << "Online metrics: origin_gain=" << origin_gain_online
+                      << ", penalty=" << penalty
+                      << ", gain=" << gain_metric
+                      << ", unsatisfied_total=" << unsatisfied_total
+                      << std::endl;
+            std::cout << "OBJ: "<<gain_metric<<std::endl;
         }
     }
 
     
-    std::vector<std::unordered_map<int, int>> sls_model::LocalSearch(std::string allocation_res_file, ModelMode mode, std::vector<std::string> online_query_list)
+    std::vector<std::unordered_map<int, int>> sls_model::LocalSearch(std::string allocation_res_file, ModelMode mode)
     {
+        // 标记在线专用需求，离线阶段跳过
+        std::vector<char> is_online(did_sid.size(), 0);
+        for (int did : last_online_list) {
+            if (did >= 0 && did < (int)is_online.size()) {
+                is_online[did] = 1;
+            }
+        }
+
         // 1. 计算每个 demand 能关联到的所有 supply 的 pv 总和
         std::vector<std::pair<int, int>> demand_total_pv; // (demand_idx, total_pv)
         for (size_t did_idx = 0; did_idx < did_sid.size(); ++did_idx) {
+            if (is_online[did_idx]) continue; // 离线跳过在线需求
             int total_pv = 0;
             for (int sid_idx : did_sid[did_idx]) {
                 total_pv += sid_pv[sid_idx];
@@ -330,6 +390,7 @@ namespace solver
 
         // 4. 按照排序后的 demand 顺序依次分配
         for (const auto& [did_idx, total_pv] : demand_total_pv) {
+            if (is_online[did_idx]) continue; // 再次防御性跳过
             double dj = did_remain_amount[did_idx];
             if (dj <= 0) continue;
             // 收集该 demand 的所有 supply 的 (sid_idx, r_i, s_i, t_i)
@@ -384,18 +445,95 @@ namespace solver
         
 
         std::string offline_allocation_res_file = allocation_res_file + "_offline.csv";
-        std::string online_allocation_res_file = allocation_res_file + "_online.csv";
         LSout_offline(offline_allocation_res_file);
-
-        
-        // auto online_query_start_time = std::chrono::high_resolution_clock::now();
-        // online_query(online_query_list);
-        // auto online_query_end_time = std::chrono::high_resolution_clock::now();
-        // auto online_query_duration = std::chrono::duration_cast<std::chrono::milliseconds>(online_query_end_time - online_query_start_time).count();
-        // std::cout << "online_query求解耗时: " << online_query_duration << " ms" << std::endl;
-        
-        // LSout_online(online_allocation_res_file);
         return sid_did_allocatepv; // 返回整数索引版本的分配结果
+    }
+    void sls_model::mark_fixed_online_demand()
+    {
+        did_online_mask.clear();
+        did_online_mask.resize(did_index.size(), 0);
+
+        if (last_online_list.empty()) {
+            std::cout << "Warning: no valid demand ID available for online allocation (demand file may be empty or all filtered)." << std::endl;
+            return;
+        }
+
+        for (int did : last_online_list) {
+            if (did >= 0 && did < (int)did_online_mask.size()) {
+                did_online_mask[did] = 1;
+            }
+        }
+
+        std::cout << "Online demands (tail of demand file, up to 50):" << std::endl;
+        for (size_t i = 0; i < last_online_idlist.size(); ++i) {
+            std::cout << "  " << last_online_idlist[i] << std::endl;
+        }
+    }
+
+    void sls_model::FIFO_online(int cutoff_seconds)
+    {
+        using clock = std::chrono::steady_clock;
+        auto time_start = clock::now();
+        size_t processed_supply = 0;
+        int timed_out = 0;
+
+        for (int sid = 0; sid < (int)sid_remainpv.size(); ++sid) {
+            if (++processed_supply % 1000 == 0) {
+                auto now = clock::now();
+                double elapsed = std::chrono::duration<double>(now - time_start).count();
+                if (elapsed > cutoff_seconds) {
+                    std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
+                    timed_out = 1;
+                    break;
+                }
+            }
+            int &remain = sid_remainpv[sid];
+            if (remain <= 0) continue;
+
+            // 按末尾顺序找到第一个仍可分配且关联该 supply 的在线需求，分配所有剩余 PV
+            for (int did : last_online_list) {
+                if (did >= (int)did_remain_amount.size()) continue;
+                if (did_remain_amount[did] <= 0) continue;
+                if (sid_did[sid].find(did) == sid_did[sid].end()) continue; // 不支持的需求跳过
+
+                int allocate = remain;
+                sid_did_allocatepv[sid][did] += allocate;
+                origin_gain_online += allocate; // gain uses actual_transfer
+
+                int demand_before = did_remain_amount[did];
+                int actual_satisfied = std::min(allocate, demand_before);
+                did_remain_amount[did] = demand_before - actual_satisfied;
+
+                remain = 0;
+                break;
+            }
+        }
+
+        if (!timed_out) {
+            std::cout << "在线 FIFO 分配完成。" << std::endl;
+        }
+    }
+
+    void sls_model::LSout_online(std::string online_res_file)
+    {
+        std::ofstream fout(online_res_file);
+        if (!fout.is_open()) {
+            std::cerr << "无法打开文件" << online_res_file << "进行写入。\n";
+            return;
+        }
+        // 与参考 FIFO 保持一致：小写表头，输出离线+在线的完整分配集
+        std::cout << "Online allocation results in file " << online_res_file << "\n";
+        fout << "sid,demand,allocated_pv\n";
+        for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
+            const std::string &sid_str = index_sid[sid];
+            for (const auto &kv : sid_did_allocatepv[sid]) {
+                int did = kv.first;
+                int pv = kv.second;
+                const std::string &did_str = index_did[did];
+                fout << sid_str << "," << did_str << "," << pv << "\n";
+            }
+        }
+        fout.close();
     }
 
     void sls_model::LSout_offline(std::string offline_res_file)
@@ -459,179 +597,5 @@ namespace solver
         }
         std::cout << std::endl;
     }
-    // #if 0 // Unused online output path
-    // void sls_model::LSout_online(std::string online_res_file)
-    // {
-    //     int total_demand_in_supply = 0;  
-    //     std::vector<int> unfinished_demands;
-    //     for (size_t did_idx = 0; did_idx < did_remain_amount.size(); ++did_idx) {
-    //         if (did_remain_amount[did_idx] > 0) {
-    //             unfinished_demands.push_back(did_idx);
-    //         }
-    //     }
-    //     if (unfinished_demands.empty()) {
-    //         std::cout << "After online allocatiion, all valid demands have been fully allocated." << std::endl;
-    //     } else {
-    //         std::cout << "Unfinished demand count: " << unfinished_demands.size() << std::endl;
-    //         std::cout << "The following valid demands still have unallocated amounts:" << std::endl;
-    //         int total_unallocated_amount = 0;
-    //         for (int did_idx : unfinished_demands) {
-    //             int remaining_amount = did_remain_amount[did_idx];
-    //             total_unallocated_amount += remaining_amount;
-    //             std::string demand_id = index_did[did_idx];
-    //             std::cout << "Demand ID: " << demand_id
-    //                     << ", Remaining Amount: " << remaining_amount
-    //                     << std::endl;
-    //         }
-    //         std::cout << "Total unallocated amount: " << total_unallocated_amount << std::endl;
-    //     }
-    //     std::ofstream output_file(online_res_file);
-    //     if (!output_file.is_open()) {
-    //         std::cerr << "无法打开文件" << online_res_file << "进行写入。\n";
-    //     } else {
-    //         std::cout << "Online allocation results in file " << online_res_file << "\n";
-    //         output_file << "SID,Demand,Allocated PV\n";
-    //         for (size_t sid_idx = 0; sid_idx < sid_did_allocatepv.size(); ++sid_idx) {
-    //             std::string sid = index_sid[sid_idx];
-    //             for (const auto& [did_idx, allocated_pv] : sid_did_allocatepv[sid_idx]) {
-    //                 std::string demand_id= index_did[did_idx];
-    //                 output_file << sid << "," 
-    //                             << demand_id << "," 
-    //                             << allocated_pv << "\n";
-    //             }
-    //         }
-    //         output_file.close();
-    //     }
-    // }
-    // #endif
-
-    // #if 0 // Unused online query path
-    // int sls_model::online_query(std::vector<std::string> demand_ids)
-    // { 
-    //     auto start_time = std::chrono::high_resolution_clock::now();
-    //     for (const auto& demand_id : demand_ids) {
-    //         int remaining_pv = query_remaining_pv_for_demand(demand_id);
-    //         std::cout << "Online query, max pv for Demand " << demand_id << ": " << remaining_pv << std::endl;
-    //     }
-    //     auto end_time = std::chrono::high_resolution_clock::now();
-    //     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    //     std::cout << "Online_query execution time: " << duration << " ms" << std::endl;
-    //     return 0;
-    // }
-    // #endif
-    // int sls_model::optimize_online(std::vector<std::string> demand_ids)
-    // { 
-    //     // 在线分配
-    //     std::vector<int> unfinished_demands;
-    //     for (const auto& demand_id : demand_ids) {
-    //         if (did_index.find(demand_id) != did_index.end()) {
-    //             unfinished_demands.push_back(did_index[demand_id]);
-    //         } else {
-    //             std::cerr << "Warning: Demand ID " << demand_id << " not found in demand index." << std::endl;
-    //         }
-    //     }
-        
-    //     int max_move_pv = move_pv(unfinished_demands, 1);
-    //     std::cout << "In optimize_online, total Max moved PV: " << max_move_pv << std::endl;
-    //     return max_move_pv;
-    // }
-    // #if 0 // Unused helper for online query
-    // int sls_model::query_remaining_pv_for_demand(std::string demand_id)
-    // { 
-    //     if (did_index.find(demand_id) == did_index.end()) {
-    //         std::cerr << "Error: Demand ID " << demand_id << " not found in demand index." << std::endl;
-    //         return 0;
-    //     }
-    //     int demand_idx = did_index[demand_id];
-    //     if (demand_idx < 0 || demand_idx >= did_sid.size()) {
-    //         std::cerr << "Error: Invalid demand index " << demand_idx << " for demand ID " << demand_id << std::endl;
-    //         return 0;
-    //     }
-    //     const std::unordered_set<int>& associated_supplies = did_sid[demand_idx];
-    //     int total_remaining_pv = 0;
-    //     for (int supply_idx : associated_supplies) {
-    //         if (supply_idx >= 0 && supply_idx < sid_remainpv.size()) {
-    //             total_remaining_pv += sid_remainpv[supply_idx];
-    //         } else {
-    //             std::cerr << "Error: Invalid supply index " << supply_idx << " for demand " << demand_id << std::endl;
-    //         }
-    //     }
-    //     total_remaining_pv = total_remaining_pv + did_amount[demand_idx] - did_remain_amount[demand_idx];
-    //     return total_remaining_pv;
-    // }
-    // #endif
-
-
-    // #if 0 // Unused PV rebalancing helper
-    // int sls_model::move_pv(std::vector<int>& unfinished_demands, double threshold)
-    // { 
-    //     std::unordered_set<int> unfinished_needed_supply; 
-    //     for (int demand_idx : unfinished_demands) {
-    //         const std::unordered_set<int>& supply_set = did_sid[demand_idx];
-    //         unfinished_needed_supply.insert(supply_set.begin(), supply_set.end());
-    //     }
-    //     std::vector<int> demand_allocatepv_from_neededsupply(did_amount.size(), 0); 
-    //     for (int supply_id : unfinished_needed_supply) {
-    //         const auto& allocation_map = sid_did_allocatepv[supply_id]; 
-    //         for (const auto& [demand_id, allocated_pv] : allocation_map) {
-    //             demand_allocatepv_from_neededsupply[demand_id] += allocated_pv; 
-    //         }
-    //     }
-    //     int max_move_pv = 0;
-    //     for (size_t demand_idx = 0; demand_idx <  did_sid.size(); ++demand_idx) 
-    //     {
-    //         if (std::find(unfinished_demands.begin(), unfinished_demands.end(), demand_idx) != unfinished_demands.end()) {
-    //             continue;
-    //         }
-    //         int need_pv = demand_allocatepv_from_neededsupply[demand_idx];
-    //         if (need_pv <= 0) {
-    //             if (need_pv < 0) {
-    //                 std::cout << "error: need_pv < 0" << std::endl;
-    //             }
-    //             continue;
-    //         }
-    //         std::unordered_set<int> canallocate_sid =  did_sid[demand_idx];
-    //         int moved_pv = 0;
-    //         for (int supply_idx : canallocate_sid) { 
-    //             if (unfinished_needed_supply.find(supply_idx) != unfinished_needed_supply.end()) {
-    //                 continue; 
-    //             }
-    //             if (sid_heat[supply_idx] >= threshold)continue;
-    //             int tmp_moved_pv = std::min(sid_remainpv[supply_idx], need_pv);
-    //             moved_pv += tmp_moved_pv;
-    //             need_pv -= tmp_moved_pv;
-    //             sid_remainpv[supply_idx] -= tmp_moved_pv;
-    //             sid_did_allocatepv[supply_idx][demand_idx] += tmp_moved_pv;
-    //             demand_allocatepv_from_neededsupply[demand_idx] -= tmp_moved_pv;
-    //             if (need_pv <= 0) {
-    //                 if (need_pv < 0) {
-    //                     std::cerr << "Error: need_pv is negative after allocation." << std::endl;
-    //                 }
-    //                 break;
-    //             }
-    //         }
-    //         max_move_pv += moved_pv;
-    //         int true_move_pv = moved_pv;
-    //         for (int supply_idx : unfinished_needed_supply) 
-    //         {
-    //             if (sid_did_allocatepv[supply_idx].find(demand_idx) == sid_did_allocatepv[supply_idx].end()) {
-    //                 continue; 
-    //             }
-    //             int tmp_moved_pv = std::min(sid_did_allocatepv[supply_idx][demand_idx],true_move_pv) ;
-    //             true_move_pv -= tmp_moved_pv;
-    //             sid_remainpv[supply_idx] += tmp_moved_pv;
-    //             sid_did_allocatepv[supply_idx][demand_idx] -= tmp_moved_pv;
-    //             if (true_move_pv <= 0) {
-    //                 if (true_move_pv < 0) {
-    //                     std::cerr << "Error: need_pv is negative after allocation." << std::endl;
-    //                 }
-    //                 break;
-    //             }
-    //         }
-    //     }
-    //     return max_move_pv; // 返回最大移动的 PV 数量
-    // }
-    // #endif
-
-
+    
 };

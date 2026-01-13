@@ -19,6 +19,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <chrono>
 
 // 反向映射表
 std::unordered_map<std::string, std::string> user_id_convert_rev;
@@ -56,11 +57,13 @@ namespace solver
         }
     }
 
-    sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set) : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set) {}
+    sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set) : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set), online_top_k(1) {}
 
     void sls_model::read_demand_data()
     {
         demand_id_amount.clear();
+        demand_read_order.clear();
+        last_valid_demand_id.clear();
         std::ifstream demand_file(demand_path);
         std::string record;
         while (getline(demand_file, record))
@@ -68,7 +71,11 @@ namespace solver
             std::vector<std::string> strs;
             split(record, strs, '`');
             demand_id_amount[strs[0]] = std::stoi(strs[1]);
+            demand_read_order.push_back(strs[0]);
             // demand_id_amount[strs[0]] = std::stoi(strs[1]) * 1.0 / 50000; // 5w original
+        }
+        if (!demand_read_order.empty()) {
+            last_valid_demand_id = demand_read_order.back();
         }
         std::cout << "demand data size: " << demand_id_amount.size() << std::endl;
         demand_file.close();
@@ -155,8 +162,9 @@ namespace solver
     /**
      * All ids or strs are used with converted ids
      */
-    void sls_model::model_problem(std::string lp_file, std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit)
+    void sls_model::model_problem(std::string lp_file, std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit, int online_top_k)
     {
+        (void)online_top_k; // online_top_k stored on model; here for signature consistency
         std::cout << "user num | supply num | demand num\n";
         std::cout << user_supply_cast_times.size() << " | " << supply_demand_set.size() << " | " << demand_id_amount.size() << std::endl;
         
@@ -431,7 +439,8 @@ namespace solver
         // m_sls_solver.write_lp_file(lp_file); // 注释掉LP文件写入
         // std::cout << "write lp file done\n";
         // solve_with_rap(lp_file, sol_file, mode, std::chrono::steady_clock::now(), time_limit); // 注释掉LP解析
-        solve_with_rap_from_model(m_sls_solver, output_base, mode, std::chrono::steady_clock::now(), time_limit);
+        solve_with_rap_from_model(m_sls_solver, output_base, mode, std::chrono::steady_clock::now(), time_limit, online_top_k);
+        // std::cout<<"test3"<<std::endl;
     }
 
     void sls_model::generate_id_convert()
@@ -474,70 +483,279 @@ namespace solver
         }
     }
 
-    void sls_model::solve_problem(std::string lp_file,std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit)
+    void sls_model::solve_problem(std::string lp_file,std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit, int online_top_k)
     {
+        this->online_top_k = online_top_k;
         read_demand_data();
         read_integer_data();
         read_heat_data();
         generate_id_convert();
-        model_problem(lp_file,output_base, nia_num, result_file,mode,time_limit);
+        init_allocation_state();
+        model_problem(lp_file,output_base, nia_num, result_file,mode,time_limit, online_top_k);
     }
 
-
-    // static inline std::string trim_str(const std::string &s) {
-    //     size_t a = s.find_first_not_of(" \t\r\n");
-    //     if (a == std::string::npos) return std::string();
-    //     size_t b = s.find_last_not_of(" \t\r\n");
-    //     return s.substr(a, b - a + 1);
-    // }
-    // static inline std::string to_lower_str(std::string s) {
-    //     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
-    //     return s;
-    // }
-    // static inline std::vector<double> matvec_prod(const std::vector<std::vector<double>> &A, const std::vector<double> &x) {
-    //     int m = (int)A.size();
-    //     std::vector<double> out(m, 0.0);
-    //     for (int i = 0; i < m; ++i) {
-    //         double s = 0.0;
-    //         const std::vector<double> &row = A[i];
-    //         int n = (int)row.size();
-    //         for (int j = 0; j < n && j < (int)x.size(); ++j) s += row[j] * x[j];
-    //         out[i] = s;
-    //     }
-    //     return out;
-    // }
-    // static inline std::vector<double> matT_vec_prod(const std::vector<std::vector<double>> &A, const std::vector<double> &y, int ncols) {
-    //     std::vector<double> out(ncols, 0.0);
-    //     int m = (int)A.size();
-    //     for (int i = 0; i < m; ++i) {
-    //         double yi = y[i];
-    //         const std::vector<double> &row = A[i];
-    //         int n = (int)row.size();
-    //         for (int j = 0; j < n && j < ncols; ++j) out[j] += row[j] * yi;
-    //     }
-    //     return out;
-    // }
-    /*
-    // 未被 main 及其调用链调用，已注释
-    static inline void expand_rows_to_n(std::vector<std::vector<double>> &A, int n) {
-        for (auto &row : A) if ((int)row.size() < n) row.resize(n, 0.0);
-    }
-    */
-
-    // void sls_model::write_solution(const std::string &filename, const std::vector<std::string> &var_list, const std::vector<double> &x) 
-    // {
-    //     std::ofstream ofs(filename);
-    //     if (!ofs.is_open()) return;
-    //     for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) 
-    //     {
-    //         int xi_rounded = static_cast<int>(std::round(x[i]));
-    //         ofs << var_list[i] << " " << xi_rounded << "\n";
-    //     }
-    //     ofs.close();
-    // }
-
-    void sls_model::solve_with_rap_from_model(const solver::opt_solver& solver, const std::string& output_base, ModelMode mode, const std::chrono::steady_clock::time_point& start_time, int time_limit)
+    void sls_model::init_allocation_state()
     {
+        sid_index.clear();
+        did_index.clear();
+        index_sid.clear();
+        index_did.clear();
+        sid_pv.clear();
+        sid_remainpv.clear();
+        sid_did.clear();
+        sid_did_allocatepv.clear();
+        did_remain_amount.clear();
+
+        int sid_counter = 0;
+        int did_counter = 0;
+
+        // 先为所有 demand 建索引（仅限于在 supply 出现的需求）
+        for (const auto &ele : supply_demand_set) {
+            for (const auto &did : ele.second) {
+                if (did_index.count(did) == 0) {
+                    did_index[did] = did_counter++;
+                    index_did.push_back(did);
+                }
+            }
+        }
+
+        // 构建 sid 及容量、可投放集合
+        for (const auto &u_entry : user_supply_demand_set) {
+            const auto &user_id = u_entry.first;
+            for (const auto &s_entry : u_entry.second) {
+                const auto &supply_id = s_entry.first;
+                std::string sid = user_id + "_" + supply_id;
+                if (sid_index.count(sid) == 0) {
+                    sid_index[sid] = sid_counter++;
+                    index_sid.push_back(sid);
+                    sid_pv.push_back(0);
+                    sid_remainpv.push_back(0);
+                    sid_did.emplace_back();
+                    sid_did_allocatepv.emplace_back();
+                }
+                int sid_idx = sid_index[sid];
+                int capacity = user_supply_cast_times[user_id][supply_id];
+                sid_pv[sid_idx] += capacity;
+                sid_remainpv[sid_idx] += capacity;
+
+                for (const auto &did : s_entry.second) {
+                    auto it = did_index.find(did);
+                    if (it == did_index.end()) continue;
+                    sid_did[sid_idx].insert(it->second);
+                }
+            }
+        }
+
+        // 初始化需求剩余量
+        did_remain_amount.resize(did_index.size(), 0);
+        for (const auto &kv : did_index) {
+            const std::string &did = kv.first;
+            int idx = kv.second;
+            if (demand_id_amount.count(did)) {
+                did_remain_amount[idx] = demand_id_amount[did];
+            }
+        }
+
+        // 清空指标
+        origin_gain_online = 0;
+        unsatisfied_total = 0;
+        penalty = 0.0;
+        gain_metric = 0.0;
+    }
+
+    void sls_model::reset_allocation_state()
+    {
+        sid_remainpv = sid_pv;
+        did_remain_amount.assign(did_index.size(), 0);
+        for (const auto &kv : did_index) {
+            const std::string &did = kv.first;
+            int idx = kv.second;
+            auto it = demand_id_amount.find(did);
+            if (it != demand_id_amount.end()) {
+                did_remain_amount[idx] = it->second;
+            }
+        }
+        for (auto &mp : sid_did_allocatepv) {
+            mp.clear();
+        }
+    }
+
+    std::vector<std::string> sls_model::choose_online_demand_ids() const
+    {
+        std::vector<std::string> targets;
+        if (online_top_k <= 0) {
+            return targets;
+        }
+
+        int remaining = online_top_k;
+        for (auto it = demand_read_order.rbegin(); it != demand_read_order.rend() && remaining > 0; ++it) {
+            if (did_index.count(*it)) {
+                targets.push_back(*it);
+                --remaining;
+            }
+        }
+        return targets;
+    }
+
+    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x)
+    {
+        reset_allocation_state();
+        std::vector<std::string> online_targets = choose_online_demand_ids();
+        std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
+        for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
+            int alloc = static_cast<int>(std::round(x[i]));
+            if (alloc <= 0) continue;
+            const std::string &var = var_list[i];
+            if (var.size() < 3 || var[0] != 'x' || var[1] != '_') continue;
+            std::vector<std::string> parts;
+            std::string var_copy = var;
+            split(var_copy, parts, '_');
+            if (parts.size() != 4) continue; // 只处理 x_user_supply_demand
+            const std::string user_orig = user_id_convert_rev[parts[1]];
+            const std::string supply_orig = supply_id_convert_rev[parts[2]];
+            const std::string demand_orig = demand_id_convert_rev[parts[3]];
+            if (!online_target_set.empty() && online_target_set.count(demand_orig)) {
+                continue; // leave for online phase
+            }
+            std::string sid = user_orig + "_" + supply_orig;
+            auto sid_it = sid_index.find(sid);
+            auto did_it = did_index.find(demand_orig);
+            if (sid_it == sid_index.end() || did_it == did_index.end()) continue;
+            int sid_idx = sid_it->second;
+            int did_idx = did_it->second;
+            sid_did_allocatepv[sid_idx][did_idx] += alloc;
+            sid_remainpv[sid_idx] = std::max(0, sid_remainpv[sid_idx] - alloc);
+            did_remain_amount[did_idx] = std::max(0, did_remain_amount[did_idx] - alloc);
+        }
+    }
+
+    void sls_model::LSout_offline(const std::string& offline_res_file)
+    {
+        std::ofstream ofs(offline_res_file);
+        if (!ofs.is_open()) {
+            std::cerr << "无法打开文件 " << offline_res_file << " 进行写入。" << std::endl;
+            return;
+        }
+        ofs << "SID,Demand,Allocated PV\n";
+        for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
+            const std::string &sid_str = index_sid[sid];
+            for (const auto &kv : sid_did_allocatepv[sid]) {
+                int did_idx = kv.first;
+                int pv = kv.second;
+                const std::string &did_str = index_did[did_idx];
+                ofs << sid_str << "," << did_str << "," << pv << "\n";
+            }
+        }
+        ofs.close();
+        std::cout << "分配方案已输出到: " << offline_res_file << std::endl;
+    }
+
+    void sls_model::mark_fixed_online_demand()
+    {
+        did_online_mask.assign(did_index.size(), 0);
+        std::vector<std::string> targets = choose_online_demand_ids();
+        for (const auto& target : targets) {
+            if (did_index.count(target)) {
+                did_online_mask[did_index[target]] = 1;
+            }
+        }
+
+        if (!targets.empty()) {
+            std::cout << "Online demand selected: ";
+            for (size_t i = 0; i < targets.size(); ++i) {
+                std::cout << targets[i] << (i + 1 == targets.size() ? "" : ", ");
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "Warning: no valid demand available for online allocation." << std::endl;
+        }
+    }
+
+    void sls_model::FIFO_online(int cutoff_seconds)
+    {
+        using clock = std::chrono::steady_clock;
+        auto time_start = clock::now();
+        size_t processed_supply = 0;
+        int timed_out = 0;
+
+        for (int sid = 0; sid < static_cast<int>(sid_remainpv.size()); ++sid) {
+            if (++processed_supply % 1000 == 0) {
+                auto now = clock::now();
+                double elapsed = std::chrono::duration<double>(now - time_start).count();
+                if (elapsed > cutoff_seconds) {
+                    std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
+                    timed_out = 1;
+                    break;
+                }
+            }
+            int &remain = sid_remainpv[sid];
+            if (remain <= 0) continue;
+
+            for (int did : sid_did[sid]) {
+                if (did >= static_cast<int>(did_online_mask.size())) continue;
+                if (did_online_mask[did] == 0) continue;
+                int allocate = remain;
+                sid_did_allocatepv[sid][did] += allocate;
+                origin_gain_online += allocate;
+
+                int demand_before = did_remain_amount[did];
+                int actual_satisfied = std::min(allocate, demand_before);
+                did_remain_amount[did] = demand_before - actual_satisfied;
+                remain = 0;
+                break;
+            }
+        }
+
+        if (!timed_out) {
+            std::cout << "在线 FIFO 分配完成。" << std::endl;
+        }
+    }
+
+    void sls_model::LSout_online(const std::string& online_res_file)
+    {
+        std::ofstream fout(online_res_file);
+        if (!fout.is_open()) {
+            std::cerr << "无法打开文件 " << online_res_file << " 进行写入。" << std::endl;
+            return;
+        }
+        fout << "sid,demand,allocated_pv\n";
+        for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
+            const std::string &sid_str = index_sid[sid];
+            for (const auto &kv : sid_did_allocatepv[sid]) {
+                int did = kv.first;
+                int pv = kv.second;
+                const std::string &did_str = index_did[did];
+                fout << sid_str << "," << did_str << "," << pv << "\n";
+            }
+        }
+        fout.close();
+        std::cout << "Online allocation results in file " << online_res_file << "\n";
+    }
+
+    void sls_model::compute_and_log_online_metrics()
+    {
+        long long unsat = 0;
+        for (int rem : did_remain_amount) {
+            unsat += rem;
+        }
+        double pen = static_cast<double>(unsat) * 1000.0;
+        double gain = static_cast<double>(origin_gain_online) - pen;
+        unsatisfied_total = unsat;
+        penalty = pen;
+        gain_metric = gain;
+        std::cout << "Online metrics: origin_gain=" << origin_gain_online
+                  << ", penalty=" << pen
+                  << ", gain=" << gain
+                  << ", unsatisfied_total=" << unsat << std::endl;
+        std::cout << "OBJ: " << gain << std::endl;
+        // std::cout<< "test1"<<std::endl;
+    }
+
+
+
+    void sls_model::solve_with_rap_from_model(const solver::opt_solver& solver, const std::string& output_base, ModelMode mode, const std::chrono::steady_clock::time_point& start_time, int time_limit, int online_top_k)
+    {
+        (void)online_top_k; // already stored in member in solve_problem
         const double alpha0 = 0.00001;
         const double tol = 1e-6;
         const double inf_bound = 1e8;
@@ -693,464 +911,17 @@ namespace solver
                 break;
             }
         }
-        // 输出结果
-            // 输出分配方案到 CSV 文件，格式与 HWM 一致：SID,Demand,Allocated PV
-            std::string csv_file = output_base + "_offline.csv";
-            std::ofstream ofs(csv_file);
-            ofs << "SID,Demand,Allocated PV\n";
-            for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
-                int alloc = static_cast<int>(std::round(x[i]));
-                if (alloc == 0) continue;
-                // 变量名格式: x_userid_supplyid_demandid
-                const std::string& var = var_list[i];
-                if (var.substr(0,2) != "x_") continue;
-                std::vector<std::string> parts;
-                split(const_cast<std::string&>(var), parts, '_');
-                    if (parts.size() == 4) {
-                        std::string user_id = user_id_convert_rev[parts[1]];
-                        std::string supply_id = supply_id_convert_rev[parts[2]];
-                        std::string demand_id = demand_id_convert_rev[parts[3]];
-                        std::string sid = user_id + "_" + supply_id;
-                        ofs << sid << "," << demand_id << "," << alloc << "\n";
-                    }
-            }
-            ofs.close();
-            std::cout << "分配方案已输出到: " << csv_file << std::endl;
-        }
+        // 输出离线结果并进入在线阶段
+        map_solution_to_allocation(var_list, x);
+        std::string offline_csv = output_base + "_offline.csv";
+        LSout_offline(offline_csv);
 
+        mark_fixed_online_demand();
+        FIFO_online(time_limit);
+        std::string online_csv = output_base + "_online.csv";
+        LSout_online(online_csv);
+        compute_and_log_online_metrics();
+        // std::cout<< "test2"<<std::endl;
+    }
 
-    /*
-    // 未被 main 及其调用链调用，已注释
-    void sls_model::solve_with_rap(const std::string& lp_file_path, const std::string& sol_file, ModelMode mode, const std::chrono::steady_clock::time_point& start_time, int time_limit)
-    */
-    // {
-    //     const double alpha0 = 0.00001;
-    //     const double tol = 1e-6;
-    //     const double inf_bound = 1e8;
-
-    //     // -----------------------
-    //     // 解析 LP 文件（与原实现相同）
-    //     std::ifstream ifs(lp_file_path);
-    //     if (!ifs.is_open()) {
-    //         std::cerr << "[RAP] 无法打开LP文件: " << lp_file_path << std::endl;
-    //         return;
-    //     }
-    //     std::ostringstream oss;
-    //     oss << ifs.rdbuf();
-    //     std::string text = oss.str();
-    //     ifs.close();
-
-    //     std::string ltext = to_lower_str(text);
-    //     auto pos_of = [&](const std::string &kw)->int {
-    //         auto p = ltext.find(to_lower_str(kw));
-    //         return p == std::string::npos ? -1 : (int)p;
-    //     };
-    //     int pMin = pos_of("minimize");
-    //     int pSub = pos_of("subject to");
-    //     int pBounds = pos_of("bounds");
-    //     int pGen = pos_of("generals");
-    //     int pEnd = pos_of("end");
-
-    //     auto section = [&](int a, int b)->std::string {
-    //         if (a < 0) return "";
-    //         if (b < 0) b = (int)text.size();
-    //         if (b <= a) return "";
-    //         return text.substr(a, b-a);
-    //     };
-
-    //     std::string minimize_sec = section(pMin, (pSub>0? pSub : (pBounds>0? pBounds : (pGen>0? pGen : pEnd))));
-    //     std::string subject_sec  = section(pSub, (pBounds>0? pBounds : (pGen>0? pGen : pEnd)));
-    //     std::string bounds_sec   = section(pBounds, (pGen>0? pGen : pEnd));
-    //     std::string generals_sec = section(pGen, pEnd);
-
-    //     // 2) 读取 LP 文件并获取变量、目标系数、二次系数、上下界等（按项注册变量）
-    //     std::unordered_map<std::string,int> var_index;
-    //     std::vector<std::string> var_list;
-    //     std::vector<double> c;
-    //     std::vector<double> w;
-    //     std::vector<double> lb;
-    //     std::vector<double> ub;
-
-    //     auto is_keyword = [&](const std::string &s)->bool {
-    //         std::string sl = to_lower_str(s);
-    //         if (sl=="minimize" || sl=="subject" || sl=="to" || sl=="bounds" || sl=="generals" || sl=="end") return true;
-    //         if (sl=="obj" || sl=="obj:") return true;
-    //         return false;
-    //     };
-
-    //     auto ensure_var = [&](const std::string &name)->int {
-    //         if (name.empty()) return -1;
-    //         std::string nl = name;
-    //         if (is_keyword(nl)) return -1;
-    //         std::string nl_low = to_lower_str(nl);
-    //         if (nl_low == "inf") return -1;
-    //         auto it = var_index.find(nl);
-    //         if (it != var_index.end()) return it->second;
-    //         int id = (int)var_list.size();
-    //         var_index[nl] = id;
-    //         var_list.push_back(nl);
-    //         c.push_back(0.0);
-    //         w.push_back(0.0);
-    //         lb.push_back(0.0);
-    //         ub.push_back(inf_bound);
-    //         return id;
-    //     };
-
-    //     if (!minimize_sec.empty()) {
-    //         size_t lbpos = minimize_sec.find('[');
-    //         size_t rbpos = std::string::npos;
-    //         if (lbpos != std::string::npos) rbpos = minimize_sec.find(']', lbpos+1);
-    //         if (lbpos != std::string::npos && rbpos != std::string::npos) {
-    //             std::string quad_body = minimize_sec.substr(lbpos+1, rbpos - lbpos - 1);
-    //             std::regex quad_term_re(R"(([+-]?\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\^?2)?)");
-    //             auto it = std::sregex_iterator(quad_body.begin(), quad_body.end(), quad_term_re);
-    //             auto end = std::sregex_iterator();
-    //             for (; it != end; ++it) {
-    //                 std::smatch m = *it;
-    //                 std::string coef_s = m.size()>1 ? m[1].str() : "";
-    //                 std::string varname = m.size()>2 ? m[2].str() : "";
-    //                 if (varname.empty()) continue;
-    //                 int id = ensure_var(varname);
-    //                 if (id < 0) continue;
-    //                 double coef = 1.0;
-    //                 if (!coef_s.empty()) {
-    //                     coef_s.erase(remove_if(coef_s.begin(), coef_s.end(), ::isspace), coef_s.end());
-    //                     try { coef = std::stod(coef_s); } catch(...) { continue; }
-    //                 }
-    //                 w[id] += coef;
-    //             }
-    //         }
-    //         std::string linear_part = minimize_sec;
-    //         if (lbpos != std::string::npos && rbpos != std::string::npos) {
-    //             linear_part.erase(lbpos, rbpos - lbpos + 1);
-    //         }
-    //         std::regex lin_term_re(R"(([+-]?\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)?\s*([A-Za-z_][A-Za-z0-9_]*))");
-    //         {
-    //             auto it = std::sregex_iterator(linear_part.begin(), linear_part.end(), lin_term_re);
-    //             auto end = std::sregex_iterator();
-    //             for (; it != end; ++it) {
-    //                 std::smatch m = *it;
-    //                 std::string coef_s = m.size()>1 ? m[1].str() : "";
-    //                 std::string varname = m.size()>2 ? m[2].str() : "";
-    //                 if (varname.empty()) continue;
-    //                 int id = ensure_var(varname);
-    //                 if (id < 0) continue;
-    //                 double coef = 1.0;
-    //                 if (!coef_s.empty()) {
-    //                     coef_s.erase(remove_if(coef_s.begin(), coef_s.end(), ::isspace), coef_s.end());
-    //                     try { coef = std::stod(coef_s); } catch(...) { continue; }
-    //                 }
-    //                 c[id] += coef;
-    //             }
-    //         }
-    //     }
-
-    //     if (!bounds_sec.empty()) {
-    //         std::stringstream ss(bounds_sec);
-    //         std::string line;
-    //         std::regex bound_re(R"(([-+eE0-9\.infINF]+)\s*<=\s*([A-Za-z_][A-Za-z0-9_]*)\s*<=\s*([-\+eE0-9\.infINF]+))", std::regex::icase);
-    //         while (std::getline(ss, line)) {
-    //             line = trim_str(line);
-    //             if (line.empty()) continue;
-    //             std::smatch m;
-    //             if (std::regex_search(line, m, bound_re)) {
-    //                 std::string left = m[1].str();
-    //                 std::string varname = m[2].str();
-    //                 std::string right = m[3].str();
-    //                 int id = ensure_var(varname);
-    //                 if (id < 0) continue;
-    //                 auto parseb = [&](const std::string &s)->double {
-    //                     std::string t = s;
-    //                     t.erase(remove_if(t.begin(), t.end(), ::isspace), t.end());
-    //                     std::string tl = to_lower_str(t);
-    //                     if (tl.find("inf") != std::string::npos) return inf_bound;
-    //                     try { return std::stod(t); } catch(...) { return 0.0; }
-    //                 };
-    //                 lb[id] = parseb(left);
-    //                 ub[id] = parseb(right);
-    //             }
-    //         }
-    //     }
-
-    //     std::vector<std::vector<double>> A_eq;
-    //     std::vector<double> b_eq;
-    //     std::vector<std::vector<double>> A_ineq;
-    //     std::vector<double> b_ineq;
-
-    //     if (!subject_sec.empty()) {
-    //         std::stringstream ss(subject_sec);
-    //         std::string raw;
-    //         std::regex rel_re(R"(<=|>=|=)");
-    //         std::regex term_re(R"(([+-]?\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)?\s*([A-Za-z_][A-Za-z0-9_]*))");
-    //         while (std::getline(ss, raw)) {
-    //             std::string line = trim_str(raw);
-    //             if (line.empty()) continue;
-    //             size_t colpos = line.find(':');
-    //             if (colpos != std::string::npos) line = trim_str(line.substr(colpos+1));
-    //             std::smatch rm;
-    //             if (!std::regex_search(line, rm, rel_re)) continue;
-    //             std::string rel = rm.str(0);
-    //             size_t rpos = line.find(rel);
-    //             std::string lhs = trim_str(line.substr(0, rpos));
-    //             std::string rhs = trim_str(line.substr(rpos + rel.size()));
-    //             double rhs_val = 0.0;
-    //             try { rhs_val = std::stod(rhs); } catch(...) { continue; }
-
-    //             std::vector<double> coeffs(var_list.size(), 0.0);
-    //             auto it = std::sregex_iterator(lhs.begin(), lhs.end(), term_re);
-    //             auto end = std::sregex_iterator();
-    //             for (; it != end; ++it) {
-    //                 std::smatch m = *it;
-    //                 std::string coef_s = m.size()>1 ? m[1].str() : "";
-    //                 std::string varname = m.size()>2 ? m[2].str() : "";
-    //                 if (varname.empty()) continue;
-    //                 double coef = 1.0;
-    //                 if (!coef_s.empty()) {
-    //                     coef_s.erase(remove_if(coef_s.begin(), coef_s.end(), ::isspace), coef_s.end());
-    //                     try { coef = std::stod(coef_s); } catch(...) { coef = 1.0; }
-    //                 }
-    //                 int id = ensure_var(varname);
-    //                 if (id < 0) continue;
-    //                 if ((int)coeffs.size() < (int)var_list.size()) coeffs.resize(var_list.size(), 0.0);
-    //                 coeffs[id] += coef;
-    //             }
-
-    //             if (rel == "=") {
-    //                 A_eq.push_back(coeffs);
-    //                 b_eq.push_back(rhs_val);
-    //             } else if (rel == ">=") {
-    //                 A_ineq.push_back(coeffs);
-    //                 b_ineq.push_back(rhs_val);
-    //             } else {
-    //                 for (int j=0;j<(int)coeffs.size();++j) coeffs[j] = -coeffs[j];
-    //                 A_ineq.push_back(coeffs);
-    //                 b_ineq.push_back(-rhs_val);
-    //             }
-    //         }
-    //     }
-
-    //     int n = (int)var_list.size();
-    //     expand_rows_to_n(A_eq, n);
-    //     expand_rows_to_n(A_ineq, n);
-
-    //     int m_eq = (int)A_eq.size();
-    //     int m_ineq = (int)A_ineq.size();
-
-    //     // -----------------------
-    //     // 转换为稀疏行表示
-    //     // -----------------------
-    //     auto dense_to_sparse_rows = [&](const std::vector<std::vector<double>>& A_dense)
-    //         -> std::vector<std::vector<std::pair<int,double>>> {
-    //         std::vector<std::vector<std::pair<int,double>>> rows;
-    //         rows.reserve(A_dense.size());
-    //         for (const auto &row : A_dense) {
-    //             std::vector<std::pair<int,double>> srow;
-    //             for (int j = 0; j < (int)row.size(); ++j) {
-    //                 double v = row[j];
-    //                 if (v != 0.0) srow.emplace_back(j, v);
-    //             }
-    //             rows.emplace_back(std::move(srow));
-    //         }
-    //         return rows;
-    //     };
-
-    //     std::vector<std::vector<std::pair<int,double>>> Aeq_rows = dense_to_sparse_rows(A_eq);
-    //     std::vector<std::vector<std::pair<int,double>>> Aineq_rows = dense_to_sparse_rows(A_ineq);
-
-    //     // 3) 初始化对偶与原始变量
-    //     std::vector<double> x(n, 0.0);
-    //     for (int j=0;j<n;++j) {
-    //         if (std::isfinite(lb[j]) && lb[j] > -inf_bound/2) x[j] = lb[j];
-    //         else x[j] = 0.0;
-    //     }
-    //     std::vector<double> mu(m_ineq, 0.0);
-    //     std::vector<double> lam(m_eq, 0.0);
-
-    //     // r = c + A_eq^T * lam + A_ineq^T * mu
-    //     // lam/mu 初始为 0，因此 r 初始化为 c
-    //     std::vector<double> r = c;
-
-    //     std::cout << "[RAP] 开始对偶子梯度迭代（改进版：稀疏+单遍历更新 r）（时间限制：" << time_limit << "秒）" << std::endl;
-
-    //     for (int t = 0; ; ++t) {
-    //         double alpha = alpha0 / std::sqrt((double)(t + 1));
-
-    //         // 用当前 r 求 x（逐分量解析）
-    //         std::vector<double> x_prev = x;
-    //         for (int j = 0; j < n; ++j) {
-    //             if (w[j] > 0.0) {
-    //                 double zj = - r[j] / w[j];
-    //                 if (zj < lb[j]) zj = lb[j];
-    //                 if (zj > ub[j]) zj = ub[j];
-    //                 x[j] = zj;
-    //             } else {
-    //                 if (r[j] > 0.0) x[j] = lb[j];
-    //                 else if (r[j] < 0.0) x[j] = ub[j];
-    //                 else x[j] = x_prev[j];
-    //             }
-    //         }
-
-    //         // 单次稀疏行遍历：计算 s = A * x - b，并直接把对偶增量的 A^T * delta 加到 r
-    //         std::vector<double> s_eq(m_eq, 0.0);
-    //         std::vector<double> s_ineq(m_ineq, 0.0);
-
-    //         // 等式行
-    //         for (int i = 0; i < m_eq; ++i) {
-    //             double Ax = 0.0;
-    //             const auto &row = Aeq_rows[i];
-    //             for (const auto &p : row) Ax += p.second * x[p.first];
-    //             double si = Ax - b_eq[i];
-    //             s_eq[i] = si;
-    //             double delta_lam = alpha * si;
-    //             lam[i] += delta_lam;
-    //             if (delta_lam != 0.0) {
-    //                 for (const auto &p : row) r[p.first] += p.second * delta_lam;
-    //             }
-    //         }
-
-    //         // 不等式行（mu 做非负投影）
-    //         for (int i = 0; i < m_ineq; ++i) {
-    //             double Ax = 0.0;
-    //             const auto &row = Aineq_rows[i];
-    //             for (const auto &p : row) Ax += p.second * x[p.first];
-    //             double si = Ax - b_ineq[i];
-    //             s_ineq[i] = si;
-
-    //             double mu_old = mu[i];
-    //             double mu_candidate = mu_old + alpha * si;
-    //             if (mu_candidate < 0.0) mu_candidate = 0.0;
-    //             double delta_mu = mu_candidate - mu_old;
-    //             if (delta_mu != 0.0) {
-    //                 for (const auto &p : row) r[p.first] += p.second * delta_mu;
-    //                 mu[i] = mu_candidate;
-    //             }
-    //         }
-
-    //         // 收敛判定（基于残差）
-    //         double max_eq_viol = 0.0;
-    //         for (int i = 0; i < m_eq; ++i) max_eq_viol = std::max(max_eq_viol, std::fabs(s_eq[i]));
-    //         double max_ineq_viol = 0.0;
-    //         for (int i = 0; i < m_ineq; ++i) {
-    //             double viol = std::max(0.0, -s_ineq[i]); // s_ineq = Ax - b, 需 b - Ax 的正部分
-    //             if (viol > max_ineq_viol) max_ineq_viol = viol;
-    //         }
-
-    //         if (t % 1000 == 0) {
-    //             double quad = 0.0;
-    //             for (int j = 0; j < n; ++j) quad += w[j] * x[j] * x[j];
-    //             double obj = 0.5 * quad;
-    //             for (int j = 0; j < n; ++j) obj += c[j] * x[j];
-    //             std::cout << "[RAP] iter=" << t << " obj=" << obj
-    //                     << " max_eq_viol=" << max_eq_viol
-    //                     << " max_ineq_viol=" << max_ineq_viol << std::endl;
-
-    //             auto current_time = std::chrono::steady_clock::now();
-    //             auto elapsed_time = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
-    //             if (elapsed_time >= time_limit) {
-    //                 std::cout << "[RAP] 时间限制已到，提前终止迭代。" << std::endl;
-    //                 break;
-    //             }
-    //         }
-
-    //         if (max_eq_viol < tol && max_ineq_viol < tol) {
-    //             std::cout << "[RAP] 收敛于 iter=" << t << ", eq_viol=" << max_eq_viol << ", ineq_viol=" << max_ineq_viol << std::endl;
-    //             break;
-    //         }
-    //     }
-
-    //     write_solution(sol_file, var_list, x);
-    // }
-
-
-    /*
-    // 未被 main 及其调用链调用，已注释
-    void sls_model::solve_with_gurobi(const std::string& lp_file_path, ModelMode mode, int time_limit, int method, int threads)
-    */
-    // {
-    //     std::cout << "开始使用 Gurobi 求解: " << lp_file_path << std::endl;
-        
-    //     // 根据 ModelMode 生成模式后缀
-    //     std::string mode_suffix;
-    //     switch (mode) {
-    //         case ZeroObj:
-    //             mode_suffix = "zeroobj";
-    //             break;
-    //         case HeatObj:
-    //             mode_suffix = "heatobj";
-    //             break;
-    //         case GivenQueryObj:
-    //             mode_suffix = "givenqueryobj";
-    //             break;
-    //         case RandQueryObj:
-    //             mode_suffix = "randqueryobj";
-    //             break;
-    //         case MaxQueryObj:
-    //             mode_suffix = "maxqueryobj";
-    //             break;
-    //         default:
-    //             mode_suffix = "unknown";
-    //             break;
-    //     }
-        
-    //     // 路径映射：从 lp_data 路径映射到 lp_solve/Gurobi 路径
-    //     std::string result_path = lp_file_path;
-    //     std::string log_path = lp_file_path;
-        
-    //     // 查找并替换路径中的 "lp_data" 为 "lp_solve/Gurobi"
-    //     size_t lp_data_pos = result_path.find("lp_data");
-    //     if (lp_data_pos != std::string::npos) {
-    //         result_path.replace(lp_data_pos, strlen("lp_data"), "lp_solve/Gurobi");
-    //         log_path = result_path;
-    //     }
-        
-    //     // 生成参数后缀
-    //     std::string param_suffix = "_time" + std::to_string(time_limit) + 
-    //                               "_method" + std::to_string(method) + 
-    //                               "_thread" + std::to_string(threads) + 
-    //                               "_" + mode_suffix;
-        
-    //     // 生成结果文件路径（在 .lp 前插入参数后缀，然后替换为 .sol）
-    //     size_t lp_ext_pos = result_path.find(".lp");
-    //     if (lp_ext_pos != std::string::npos) {
-    //         result_path.insert(lp_ext_pos, param_suffix);
-    //         result_path.replace(result_path.find(".lp"), 3, ".sol");
-    //     }
-        
-    //     // 生成日志文件路径（在 .lp 前插入参数后缀，然后替换为 .log）
-    //     lp_ext_pos = log_path.find(".lp");
-    //     if (lp_ext_pos != std::string::npos) {
-    //         log_path.insert(lp_ext_pos, param_suffix);
-    //         log_path.replace(log_path.find(".lp"), 3, ".log");
-    //     }
-        
-    //     // 创建输出目录
-    //     std::string result_dir = result_path.substr(0, result_path.find_last_of('/'));
-    //     std::string mkdir_cmd = "mkdir -p \"" + result_dir + "\"";
-    //     int mkdir_ret = system(mkdir_cmd.c_str());
-    //     if (mkdir_ret != 0) {
-    //         std::cerr << "警告: 创建目录失败: " << result_dir << std::endl;
-    //     }
-        
-    //     // 构建 Gurobi 命令
-    //     std::string gurobi_cmd = "gurobi_cl TimeLimit=" + std::to_string(time_limit) + 
-    //                             " ResultFile=\"" + result_path + 
-    //                             "\" Method=" + std::to_string(method) + 
-    //                             " Threads=" + std::to_string(threads) + 
-    //                             " LogFile=\"" + log_path + "\" \"" + lp_file_path + "\"";
-        
-    //     std::cout << "执行 Gurobi 命令: " << gurobi_cmd << std::endl;
-    //     std::cout << "模式: " << mode_suffix << std::endl;
-    //     std::cout << "参数: TimeLimit=" << time_limit << ", Method=" << method << ", Threads=" << threads << std::endl;
-        
-    //     // 执行 Gurobi 求解
-    //     int ret = system(gurobi_cmd.c_str());
-        
-    //     if (ret == 0) {
-    //         std::cout << "Gurobi 求解完成" << std::endl;
-    //         std::cout << "结果文件: " << result_path << std::endl;
-    //         std::cout << "日志文件: " << log_path << std::endl;
-    //     } else {
-    //         std::cerr << "Gurobi 求解失败，返回码: " << ret << std::endl;
-    //     }
-    // }
 };

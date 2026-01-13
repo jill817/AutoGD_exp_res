@@ -15,6 +15,6 @@ To run the solver, using
 
 
 # 修改后运行
-./.build/solver /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/test_demand_multicomponent.txt /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/test_supply_multicomponent.txt /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/test_heat_multicomponent.txt /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/ > test.out
+./src/solver test/test_demand.txt test/test_supply.txt test/test_heat.txt test/
 
-./.build/solver /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/demand/offline/0531_01_10.txt /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/supply/0531_01_10.txt /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/heat/0531_01_10.txt /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/
+./src/solver /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/demand/offline/0531_01_10.txt /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/supply/0531_01_10.txt /pub/netdisk1/lijy/AutoGD_exp_data/sample1000/heat/0531_01_10.txt /pub/netdisk1/lijy/Auto_GD/src/examples/BOLS/original_BOLS/test/

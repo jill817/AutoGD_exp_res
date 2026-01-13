@@ -90,3 +90,53 @@ user1_supply1,2,30
 ```
 - `3600`: 最大运行时间为 3600 秒。
 
+# 函数调用树
+main
+  └─ solve
+    └─ solver::sls_model::sls_model (未找到实现)
+    └─ solver::sls_model::solve_problem
+      └─ solver::sls_model::read_demand_data
+        └─ solver::split
+      └─ solver::sls_model::read_integer_data
+        └─ solver::split
+        └─ solver::split
+      └─ solver::sls_model::read_heat_data
+        └─ solver::split
+      └─ solver::sls_model::generate_id_convert
+      └─ solver::sls_model::model_problem
+        └─ solver::opt_solver::register_var
+          └─ solver::opt_solver::imp::register_var
+            └─ solver::var::var (未找到实现)
+        └─ solver::opt_solver::register_var
+          └─ solver::opt_solver::imp::register_var
+            └─ solver::var::var (未找到实现)
+        └─ solver::opt_solver::register_var
+          └─ solver::opt_solver::imp::register_var
+            └─ solver::var::var (未找到实现)
+        └─ ::__builtin_inff (未找到实现)
+        └─ solver::monomial::monomial (未找到实现)
+        └─ solver::monomial::monomial (未找到实现)
+        └─ solver::polynomial::polynomial (未找到实现)
+        └─ solver::opt_solver::register_constraint
+          └─ solver::opt_solver::imp::register_constraint
+            └─ solver::constraint::constraint (未找到实现)
+        └─ solver::monomial::monomial (未找到实现)
+        └─ solver::polynomial::polynomial (未找到实现)
+        └─ solver::opt_solver::register_constraint
+          └─ solver::opt_solver::imp::register_constraint
+            └─ solver::constraint::constraint (未找到实现)
+        └─ solver::monomial::monomial (未找到实现)
+        └─ solver::monomial::monomial (未找到实现)
+        └─ solver::polynomial::polynomial (未找到实现)
+        └─ solver::opt_solver::register_constraint
+          └─ solver::opt_solver::imp::register_constraint
+            └─ solver::constraint::constraint (未找到实现)
+        └─ solver::sls_model::solve_with_rap_from_model
+          └─ solver::opt_solver::get_vars
+          └─ solver::opt_solver::get_constraints
+          └─ solver::sls_model::solve_with_rap_from_model::::operator() (未找到实现)
+          └─ solver::sls_model::solve_with_rap_from_model::::operator() (未找到实现)
+          └─ solver::split
+
+# 改成在线
+我现在/pub/netdisk1/lijy/Auto_GD/src/examples/RAP/original_RAP/src里面是一个项目，你可以发现是求解输出一个离线文件。然后读一下/pub/netdisk1/lijy/Auto_GD/src/examples/RAP/original_RAP/original_HWM里面的代码，会发现 LocalSearch 离线求解之后，还有函数用来在线求解输出一些指标以及在线分配方案。我现在希望把后者的在线过程迁移到前者，你能不能阅读全部代码，然后帮我想想怎么做。

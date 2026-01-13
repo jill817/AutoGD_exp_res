@@ -8,8 +8,8 @@ enum ModelMode {
     HeatObj,   // heatobj
     GivenQueryObj,   // givenqueryobj
     RandQueryObj, // randqueryobj
-    MaxQueryObj, // maxqueryobj
-    Greedy
+    LastQueryObj, // lastqueryobj
+    MaxQueryObj // maxqueryobj
 };
 
 } // namespace solver

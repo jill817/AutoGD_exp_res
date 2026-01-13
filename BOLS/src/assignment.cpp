@@ -12,12 +12,12 @@ void OperatorPool::clear() {
 
 long long OperatorPool::size() {
     if (JUDGE) assert(_vars.size() == _vals.size());
-    return _vars.size();
+    return static_cast<long long>(_vars.size());
 }
 
 void OperatorPool::push(allocateVar var, long long val) {
     if (JUDGE) assert(_vars.size() == _vals.size());
-    if (JUDGE) assert(_vars.size() == _size);
+    if (JUDGE) assert(static_cast<long long>(_vars.size()) == _size);
 
     //if (!haveOperator(var, val)) {
         _vars.push_back(var);
@@ -49,13 +49,13 @@ bool OperatorPool::empty() const {
 
 
 allocateVar OperatorPool::varAt(long long index) const {
-    if (JUDGE) assert(index < _vars.size());
-    return _vars.at(index);
+    if (JUDGE) assert(index >= 0 && static_cast<size_t>(index) < _vars.size());
+    return _vars.at(static_cast<size_t>(index));
 }
 
 long long OperatorPool::valAt(long long index) const {
-    if (JUDGE) assert(index < _vals.size());
-    return _vals.at(index);
+    if (JUDGE) assert(index >= 0 && static_cast<size_t>(index) < _vals.size());
+    return _vals.at(static_cast<size_t>(index));
 }
 
 void OperatorPool::removeOpAt(long long index) {

@@ -170,7 +170,7 @@ void MultiObjectiveData::show_data(){
 
     for(long long demand = 0; demand < demand_cnt; demand++){
         // cout << demand << " " << demand_value[demand] << "  finish  " << endl;
-        for (long long j = 0; j < map_demand2supply[demand].size(); j++){
+        for (std::size_t j = 0; j < map_demand2supply[demand].size(); j++){
             long long supply = map_demand2supply[demand][j];
             long long position = getAlloPosition(demand,j);
             allocateVar var = assign_supply2demand[supply][position];
@@ -215,7 +215,7 @@ void MultiObjectiveData::init_allocation(){
     for(long long demand_index = 0; demand_index < demand_cnt; demand_index++){
         vector<balance_coefficient> balance_vec;
 
-        for(long long i = 0; i < map_demand2supply[demand_index].size(); i++){
+        for(std::size_t i = 0; i < map_demand2supply[demand_index].size(); i++){
 
             long long supply_index1 = map_demand2supply[demand_index][i];
             long long position      = allocat_position_in_supply[demand_index][i];
@@ -224,6 +224,7 @@ void MultiObjectiveData::init_allocation(){
             long long total_demand_supply_val = get_total_demand_supply_value(demand_index);
             
             balance_coefficient balance_coef;
+            assert(total_demand_supply_val != 0);
             balance_coef.val = (double)supply_val / total_demand_supply_val * demand_val;
             balance_coef.demand_index = demand_index;
             balance_coef.supply_index = supply_index1;
@@ -238,7 +239,7 @@ void MultiObjectiveData::init_allocation(){
         std::sort(balance_vec.begin(),balance_vec.end(),cmp_balance_coef);
         // cout << "-------------balance vec size" << balance_vec.size() << endl;
 
-        long long i = 0;
+        // long long i = 0;
         for (balance_coefficient balance_coef : balance_vec){
 
             if (demand_remain[demand_index] <= 0) break;
@@ -261,6 +262,7 @@ void MultiObjectiveData::init_allocation(){
         query_supply_sum += supply_value[supply];
     }
     for (auto supply : obj1_query_supply){
+        assert(query_supply_sum != 0);
         double coef = (double) supply_value[supply] / query_supply_sum;
         query_const_coef.push_back(coef);
     }
@@ -319,7 +321,7 @@ bool MultiObjectiveData::init_solution(){
     }
 
     double    obj2 = calcu_objective2_value();
-    for (int i = 0; i < obj1_query_supply.size(); i++){
+    for (std::size_t i = 0; i < obj1_query_supply.size(); i++){
         obj2 += abs((double) query_const_coef[i] * query_use_total - query_use[i]);
     }
 
@@ -420,8 +422,8 @@ double MultiObjectiveData::calcu_objective2_value(){
     double total_obj2_value = 0.0;
 
     for (long long supply = 0; supply < supply_cnt; supply++){
-        for (long long position = 0; position < map_supply2demand[supply].size(); position++){
-            long long demand = map_supply2demand[supply][position];
+        for (std::size_t position = 0; position < map_supply2demand[supply].size(); position++){
+            // long long demand = map_supply2demand[supply][position];
 
             allocateVar var = assign_supply2demand[supply][position];
             double var_value = var.allocate_value;
@@ -445,7 +447,7 @@ long long MultiObjectiveData::calcu_objective1_supply_query(){
 
 // supply is exceed, and we need to decrease the use of supply
 void MultiObjectiveData::do_sat_supply_move(long long supply){
-    for (long long position = 0; position < map_supply2demand[supply].size(); position++){
+    for (std::size_t position = 0; position < map_supply2demand[supply].size(); position++){
         allocateVar var = assign_supply2demand[supply][position];
         long long demand = map_supply2demand[supply][position];
         assert(supply_remain[supply] < 0);
@@ -466,7 +468,7 @@ void MultiObjectiveData::do_sat_supply_move(long long supply){
                 long long supply_2 = map_demand2supply[demand][index];
                 allocateVar var = assign_supply2demand[demand][index];
                 if (supply_remain[supply_2] > 0){
-                    long long trans_val = std::min({supply_exceed, supply_remain[supply_2], var.allocate_value});
+                    // long long trans_val = std::min({supply_exceed, supply_remain[supply_2], var.allocate_value});
                 }
             }
         }
@@ -475,7 +477,7 @@ void MultiObjectiveData::do_sat_supply_move(long long supply){
 
 void MultiObjectiveData::do_sat_demand_move_2(){
     for (auto demand : unsat_demand_vec){
-        for (long long position_in_demand = 0; position_in_demand < map_demand2supply[demand].size(); position_in_demand++){
+        for (std::size_t position_in_demand = 0; position_in_demand < map_demand2supply[demand].size(); position_in_demand++){
             long long supply = map_demand2supply[demand][position_in_demand];
             long long position_in_supply = allocat_position_in_supply[demand][position_in_demand];
             allocateVar var = assign_supply2demand[supply][position_in_supply];
@@ -506,7 +508,7 @@ void MultiObjectiveData::do_sat_constraint_move(){
     //cout << endl;
 
     for (auto supply : unsat_supply_vec){
-        for (long long position = 0; position < map_supply2demand[supply].size(); position++){
+        for (std::size_t position = 0; position < map_supply2demand[supply].size(); position++){
             allocateVar var = assign_supply2demand[supply][position];
             long long demand = map_supply2demand[supply][position];
             // cout << "supply: " << supply << " remain: " << supply_remain[supply] << "  value: " << supply_value[supply] << endl;
@@ -550,7 +552,7 @@ void MultiObjectiveData::do_sat_constraint_move(){
     //cout << endl;
 
     for (auto demand : unsat_demand_vec){
-        for (long long position_in_demand = 0; position_in_demand < map_demand2supply[demand].size(); position_in_demand++){
+        for (std::size_t position_in_demand = 0; position_in_demand < map_demand2supply[demand].size(); position_in_demand++){
             long long supply = map_demand2supply[demand][position_in_demand];
             long long position_in_supply = allocat_position_in_supply[demand][position_in_demand];
             allocateVar var = assign_supply2demand[supply][position_in_supply];
@@ -602,7 +604,7 @@ void MultiObjectiveData::do_sat_constraint_move_new(){
     // for (auto demand : map_supply2demand[supply]) cout << demand << " ";
     // cout << endl;
 
-    for (long long position = 0; position < map_supply2demand[supply].size(); position++){
+    for (std::size_t position = 0; position < map_supply2demand[supply].size(); position++){
         allocateVar var = assign_supply2demand[supply][position];
         long long demand = map_supply2demand[supply][position];
         // cout << "supply: " << supply << " remain: " << supply_remain[supply] << "  value: " << supply_value[supply] << endl;
@@ -744,7 +746,7 @@ void MultiObjectiveData::do_improve_balance_move(){
         long long available_supply_all = 0;
         vector<balance_coefficient> balance_vec;
 
-        for(long long i = 0; i < map_demand2supply[demand_index].size(); i++){
+        for(std::size_t i = 0; i < map_demand2supply[demand_index].size(); i++){
 
             long long supply_index1 = map_demand2supply[demand_index][i];
             long long position      = allocat_position_in_supply[demand_index][i];
@@ -1143,7 +1145,7 @@ void MultiObjectiveData::delete_solution(){
 
     // best_assign_vec[num1] = best_assign_vec[solution_vec_size - 1];
     // best_assign_vec.pop_back();
-    for (int i = 0; i < best_obj_value_vec.size(); i++){
+    for (std::size_t i = 0; i < best_obj_value_vec.size(); i++){
         if (best_obj_value_vec[i].delete_flag == true){
             best_obj_value_vec[i] = best_obj_value_vec[best_obj_value_vec.size() - 1];
             best_obj_value_vec.pop_back();
@@ -1161,9 +1163,9 @@ void MultiObjectiveData::push_assignment(long long num1){
      best_obj_value_vec[num1].assign_vec.resize(supply_cnt + 1);
     assert(num1 < best_obj_value_vec.size());
 
-    for (long long supply = 0; supply < supply_cnt; supply++){
+    for (std::size_t supply = 0; supply < supply_cnt; supply++){
         best_obj_value_vec[num1].assign_vec[supply].resize(assign_supply2demand[supply].size());
-        for (long long index = 0; index < assign_supply2demand[supply].size(); index++){
+        for (std::size_t index = 0; index < assign_supply2demand[supply].size(); index++){
             long long demand = map_supply2demand[supply][index];
             allocateVar var = assign_supply2demand[supply][index];
             best_obj_value_vec[num1].assign_vec[supply][index] = var;
@@ -1304,8 +1306,8 @@ bool MultiObjectiveData::check_solution(Solu solu){
     vector<long long> demand_vec(demand_cnt + 1, 0);
     vector<long long> supply_vec(supply_cnt + 1, 0);
 
-    for (long long supply = 0; supply < supply_cnt; supply++){
-        for (long long pos = 0; pos < map_supply2demand[supply].size(); pos++){
+    for (std::size_t supply = 0; supply < supply_cnt; supply++){
+        for (std::size_t pos = 0; pos < map_supply2demand[supply].size(); pos++){
             long long demand = map_supply2demand[supply][pos];
             allocateVar var = solu.assign_vec[supply][pos];
             // cout << "var.supply_index == supply  " << var.supply_index << "  " << var.demand_index << " " << supply << " " << demand << endl;
@@ -1344,7 +1346,7 @@ double MultiObjectiveData::hyper_volume(){
     paretosolu1.obj2 = 0;
     solu_vec.push_back(paretosolu1);
 
-    for (int i = 0; i < best_obj_value_vec.size(); i++){
+    for (std::size_t i = 0; i < best_obj_value_vec.size(); i++){
         ParetoSolution paretosolu1;
         paretosolu1.obj1 = best_obj_value_vec[i].obj1;
         paretosolu1.obj2 = best_obj_value_vec[i].obj2;
@@ -1354,7 +1356,7 @@ double MultiObjectiveData::hyper_volume(){
 
     long long upperbound = 1000000;
 
-    for (int i = 0; i < solu_vec.size(); i++){
+    for (std::size_t i = 0; i < solu_vec.size(); i++){
         double volume = 0;
         if (i == 0) volume = (upperbound - solu_vec[i].obj2) * solu_vec[i].obj1;
         else {
@@ -1376,7 +1378,7 @@ int MultiObjectiveData::objective_order(){
         obj1_degree++;
     }
 
-    for(long long demand_index = 0; demand_index < demand_cnt; demand_index++){
+    for(std::size_t demand_index = 0; demand_index < demand_cnt; demand_index++){
         for(long long i = 0; i < map_demand2supply[demand_index].size(); i++){
             obj2_degree += 2;
         }
@@ -1461,9 +1463,12 @@ bool MultiObjectiveData::do_1step_improve_move(){
         if (map_demand2supply[demand].size() == 0) continue;
         if (demand_remain[demand] >= 0) continue;
 
-        index = rand() % map_demand2supply[demand].size();
+        // index = rand() % map_demand2supply[demand].size();
+
+
 
         long long remain_size = map_demand2supply[demand].size() - i;
+        if(remain_size == 0) continue; // remain_size为0时跳过本次尝试，防止除零
 
         allocateVar var1 = assign_supply2demand[supply_out][pos1];
 
@@ -1577,7 +1582,9 @@ bool MultiObjectiveData::do_1step_reduce_move_new(){
 
         index = rand() % map_demand2supply[demand].size();
 
+
         long long remain_size = map_demand2supply[demand].size() - i;
+        if(remain_size == 0) continue;
 
         allocateVar var1 = assign_supply2demand[supply_out][pos1];
 
@@ -1689,7 +1696,7 @@ bool MultiObjectiveData::do_2step_reduce_move_new_bal2(long long demand){
     vector<long long> val_need_increase;    //restore pos
     vector<long long> val_need_decrease;    //restore pos
 
-    for (long long pos = 0; pos < map_demand2supply[demand].size(); pos++){
+    for (std::size_t pos = 0; pos < map_demand2supply[demand].size(); pos++){
         long long supply = map_demand2supply[demand][pos];
         long long supply_pos = allocat_position_in_supply[demand][pos];
         // if (obj1_supply_flag[supply] == 1) continue;
@@ -1708,9 +1715,10 @@ bool MultiObjectiveData::do_2step_reduce_move_new_bal2(long long demand){
     bool find_best_flag = false;
 
     if (val_need_decrease.empty() || val_need_increase.empty()) return false;
-
-    for(int i = 0; i < BMS; i++)
+    int max_try = std::min({(long long)BMS, (long long)val_need_increase.size(), (long long)val_need_decrease.size()});
+    for(int i = 0; i < max_try; i++)
     {
+        if(val_need_decrease.empty() || val_need_increase.empty()) break;
         long long pos1_demand = val_need_decrease.back();   //1 - decrease
         long long pos2_demand = val_need_increase.back();   //2 - increase
         val_need_decrease.pop_back();
