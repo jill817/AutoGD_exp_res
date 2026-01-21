@@ -350,11 +350,15 @@ namespace solver
             }
         }
         std::unordered_map<std::string, int> slack_vars;
-        double BIG_COEFFICIENT = 31708040;
+        // Refinement: Make slack penalty proportional to demand amount for better balancing
+        double BASE_BIG_COEFFICIENT = 31708040;
         for (auto ele : demand_vars) {
             auto demand_id = ele.first;
+            int demand_amount = demand_id_amount[demand_id];
+            // Scale coefficient by demand amount (plus small epsilon to avoid zero)
+            double scaled_coefficient = BASE_BIG_COEFFICIENT * (1.0 + 0.0001 * demand_amount);
             std::string slack_var_name = "p_" + demand_id_convert[demand_id];
-            int slack_var_index = m_sls_solver.register_var(slack_var_name, BIG_COEFFICIENT, true, true, 0, INFINITY);
+            int slack_var_index = m_sls_solver.register_var(slack_var_name, scaled_coefficient, true, true, 0, INFINITY);
             slack_vars[demand_id] = slack_var_index;
         }
         
@@ -581,74 +585,208 @@ namespace solver
     }
 
     std::vector<std::string> sls_model::choose_online_demand_ids() const
-    {
-        std::vector<std::string> targets;
-        if (online_top_k <= 0) {
-            return targets;
-        }
-
-        int remaining = online_top_k;
-        for (auto it = demand_read_order.rbegin(); it != demand_read_order.rend() && remaining > 0; ++it) {
-            if (did_index.count(*it)) {
-                targets.push_back(*it);
-                --remaining;
-            }
-        }
+{
+    std::vector<std::string> targets;
+    if (online_top_k <= 0) {
         return targets;
     }
 
-    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x)
-    {
-        reset_allocation_state();
-        std::vector<std::string> online_targets = choose_online_demand_ids();
-        std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
-        for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
-            int alloc = static_cast<int>(std::round(x[i]));
-            if (alloc <= 0) continue;
-            const std::string &var = var_list[i];
-            if (var.size() < 3 || var[0] != 'x' || var[1] != '_') continue;
-            std::vector<std::string> parts;
-            std::string var_copy = var;
-            split(var_copy, parts, '_');
-            if (parts.size() != 4) continue; // 只处理 x_user_supply_demand
-            const std::string user_orig = user_id_convert_rev[parts[1]];
-            const std::string supply_orig = supply_id_convert_rev[parts[2]];
-            const std::string demand_orig = demand_id_convert_rev[parts[3]];
-            if (!online_target_set.empty() && online_target_set.count(demand_orig)) {
-                continue; // leave for online phase
+    // Collect valid demands with their amounts
+    std::vector<std::pair<std::string, int>> valid_demands;
+    for (const auto& demand_id : demand_read_order) {
+        if (did_index.count(demand_id)) {
+            auto it = demand_id_amount.find(demand_id);
+            if (it != demand_id_amount.end()) {
+                valid_demands.emplace_back(demand_id, it->second);
             }
-            std::string sid = user_orig + "_" + supply_orig;
-            auto sid_it = sid_index.find(sid);
-            auto did_it = did_index.find(demand_orig);
-            if (sid_it == sid_index.end() || did_it == did_index.end()) continue;
-            int sid_idx = sid_it->second;
-            int did_idx = did_it->second;
-            sid_did_allocatepv[sid_idx][did_idx] += alloc;
-            sid_remainpv[sid_idx] = std::max(0, sid_remainpv[sid_idx] - alloc);
-            did_remain_amount[did_idx] = std::max(0, did_remain_amount[did_idx] - alloc);
         }
     }
 
-    void sls_model::LSout_offline(const std::string& offline_res_file)
-    {
-        std::ofstream ofs(offline_res_file);
-        if (!ofs.is_open()) {
-            std::cerr << "无法打开文件 " << offline_res_file << " 进行写入。" << std::endl;
-            return;
+    // Sort by amount ascending (smallest amounts first)
+    std::sort(valid_demands.begin(), valid_demands.end(),
+              [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+                  return a.second < b.second;
+              });
+
+    // Select top k smallest amounts
+    int remaining = std::min(online_top_k, static_cast<int>(valid_demands.size()));
+    for (int i = 0; i < remaining; ++i) {
+        targets.push_back(valid_demands[i].first);
+    }
+
+    return targets;
+}
+
+    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x)
+{
+    reset_allocation_state();
+    std::vector<std::string> online_targets = choose_online_demand_ids();
+    std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
+    
+    // First pass: collect all allocation variables with their continuous values
+    struct AllocationVar {
+        size_t index;
+        double value;
+        std::string var;
+        int sid_idx;
+        int did_idx;
+    };
+    
+    std::vector<AllocationVar> candidates;
+    
+    for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
+        if (x[i] <= 0.0) continue;
+        
+        const std::string &var = var_list[i];
+        if (var.size() < 3 || var[0] != 'x' || var[1] != '_') continue;
+        
+        std::vector<std::string> parts;
+        std::string var_copy = var;
+        split(var_copy, parts, '_');
+        if (parts.size() != 4) continue; // only process x_user_supply_demand
+        
+        const std::string user_orig = user_id_convert_rev[parts[1]];
+        const std::string supply_orig = supply_id_convert_rev[parts[2]];
+        const std::string demand_orig = demand_id_convert_rev[parts[3]];
+        
+        if (!online_target_set.empty() && online_target_set.count(demand_orig)) {
+            continue; // leave for online phase
         }
-        ofs << "SID,Demand,Allocated PV\n";
-        for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
-            const std::string &sid_str = index_sid[sid];
-            for (const auto &kv : sid_did_allocatepv[sid]) {
-                int did_idx = kv.first;
-                int pv = kv.second;
-                const std::string &did_str = index_did[did_idx];
-                ofs << sid_str << "," << did_str << "," << pv << "\n";
+        
+        std::string sid = user_orig + "_" + supply_orig;
+        auto sid_it = sid_index.find(sid);
+        auto did_it = did_index.find(demand_orig);
+        if (sid_it == sid_index.end() || did_it == did_index.end()) continue;
+        
+        candidates.push_back({i, x[i], var, sid_it->second, did_it->second});
+    }
+    
+    // Sort candidates by continuous value in descending order
+    // This prioritizes allocations with higher continuous values first
+    std::sort(candidates.begin(), candidates.end(), 
+              [](const AllocationVar& a, const AllocationVar& b) {
+                  return a.value > b.value;
+              });
+    
+    // Second pass: allocate in sorted order with adaptive rounding
+    for (const auto& cand : candidates) {
+        double frac = cand.value - std::floor(cand.value);
+        int alloc = static_cast<int>(std::floor(cand.value)); // base allocation
+        
+        // Adaptive rounding: round up only if fractional part exceeds threshold
+        // and there's enough remaining capacity and demand
+        if (frac > 0.5 && 
+            sid_remainpv[cand.sid_idx] > alloc && 
+            did_remain_amount[cand.did_idx] > alloc) {
+            alloc += 1;
+        }
+        
+        if (alloc <= 0) continue;
+        
+        // Ensure we don't exceed remaining capacities
+        int actual_alloc = std::min(alloc, sid_remainpv[cand.sid_idx]);
+        actual_alloc = std::min(actual_alloc, did_remain_amount[cand.did_idx]);
+        
+        if (actual_alloc <= 0) continue;
+        
+        sid_did_allocatepv[cand.sid_idx][cand.did_idx] += actual_alloc;
+        sid_remainpv[cand.sid_idx] = std::max(0, sid_remainpv[cand.sid_idx] - actual_alloc);
+        did_remain_amount[cand.did_idx] = std::max(0, did_remain_amount[cand.did_idx] - actual_alloc);
+    }
+}
+
+    void sls_model::LSout_offline(const std::string& offline_res_file)
+{
+    // Greedy reallocation heuristic to improve offline allocation quality
+    // This post-processing step uses remaining supply to satisfy more offline demand
+    
+    // Step 1: First write the original allocation (unchanged behavior)
+    std::ofstream ofs(offline_res_file);
+    if (!ofs.is_open()) {
+        std::cerr << "无法打开文件 " << offline_res_file << " 进行写入。" << std::endl;
+        return;
+    }
+    ofs << "SID,Demand,Allocated PV\n";
+    
+    // Step 2: Create local copies for reallocation processing
+    // We'll work with the existing member variables but modify them locally first
+    std::vector<int> local_sid_remainpv = sid_remainpv;
+    std::vector<int> local_did_remain_amount = did_remain_amount;
+    std::vector<std::unordered_map<int, int>> local_sid_did_allocatepv = sid_did_allocatepv;
+    
+    // Step 3: Greedy reallocation of remaining supply
+    // For each supply node with remaining PVs
+    for (size_t sid = 0; sid < local_sid_remainpv.size(); ++sid) {
+        int remaining_pv = local_sid_remainpv[sid];
+        if (remaining_pv <= 0) continue;
+        
+        // Find eligible demands for this supply node (based on sid_did connectivity)
+        // We'll prioritize demands with highest remaining amount
+        std::vector<std::pair<int, int>> eligible_demands; // (did_idx, remaining_amount)
+        
+        for (int did_idx : sid_did[sid]) {
+            if (did_idx < 0 || did_idx >= static_cast<int>(local_did_remain_amount.size())) continue;
+            
+            // Skip online demands (if we can identify them)
+            // Note: We don't have did_online_mask here, so we process all
+            int demand_remaining = local_did_remain_amount[did_idx];
+            if (demand_remaining > 0) {
+                eligible_demands.emplace_back(did_idx, demand_remaining);
             }
         }
-        ofs.close();
-        std::cout << "分配方案已输出到: " << offline_res_file << std::endl;
+        
+        // Sort by remaining amount (descending) to prioritize high-demand nodes
+        std::sort(eligible_demands.begin(), eligible_demands.end(),
+                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                      return a.second > b.second;
+                  });
+        
+        // Allocate remaining PVs greedily
+        for (const auto& demand_pair : eligible_demands) {
+            if (remaining_pv <= 0) break;
+            
+            int did_idx = demand_pair.first;
+            int alloc_amount = std::min(remaining_pv, demand_pair.second);
+            
+            // Update local allocations
+            local_sid_did_allocatepv[sid][did_idx] += alloc_amount;
+            local_did_remain_amount[did_idx] -= alloc_amount;
+            remaining_pv -= alloc_amount;
+        }
+        
+        // Update remaining PVs for this supply node
+        local_sid_remainpv[sid] = remaining_pv;
     }
+    
+    // Step 4: Write the improved allocation to file
+    for (size_t sid = 0; sid < local_sid_did_allocatepv.size(); ++sid) {
+        const std::string &sid_str = index_sid[sid];
+        for (const auto &kv : local_sid_did_allocatepv[sid]) {
+            int did_idx = kv.first;
+            int pv = kv.second;
+            const std::string &did_str = index_did[did_idx];
+            ofs << sid_str << "," << did_str << "," << pv << "\n";
+        }
+    }
+    
+    // Step 5: Update member variables with improved allocation
+    // This ensures subsequent online phase uses the improved state
+    sid_did_allocatepv = std::move(local_sid_did_allocatepv);
+    sid_remainpv = std::move(local_sid_remainpv);
+    did_remain_amount = std::move(local_did_remain_amount);
+    
+    ofs.close();
+    
+    // Calculate and report improvement statistics
+    int total_reallocated = 0;
+    int remaining_unsatisfied = 0;
+    for (int rem : did_remain_amount) {
+        remaining_unsatisfied += rem;
+    }
+    
+    std::cout << "优化后分配方案已输出到: " << offline_res_file << std::endl;
+    std::cout << "剩余未满足需求总量: " << remaining_unsatisfied << std::endl;
+}
 
     void sls_model::mark_fixed_online_demand()
     {
@@ -672,84 +810,133 @@ namespace solver
     }
 
     void sls_model::FIFO_online(int cutoff_seconds)
-    {
-        using clock = std::chrono::steady_clock;
-        auto time_start = clock::now();
-        size_t processed_supply = 0;
-        int timed_out = 0;
+{
+    using clock = std::chrono::steady_clock;
+    auto time_start = clock::now();
+    size_t processed_supply = 0;
+    int timed_out = 0;
 
-        for (int sid = 0; sid < static_cast<int>(sid_remainpv.size()); ++sid) {
-            if (++processed_supply % 1000 == 0) {
-                auto now = clock::now();
-                double elapsed = std::chrono::duration<double>(now - time_start).count();
-                if (elapsed > cutoff_seconds) {
-                    std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
-                    timed_out = 1;
-                    break;
-                }
-            }
-            int &remain = sid_remainpv[sid];
-            if (remain <= 0) continue;
-
-            for (int did : sid_did[sid]) {
-                if (did >= static_cast<int>(did_online_mask.size())) continue;
-                if (did_online_mask[did] == 0) continue;
-                int allocate = remain;
-                sid_did_allocatepv[sid][did] += allocate;
-                origin_gain_online += allocate;
-
-                int demand_before = did_remain_amount[did];
-                int actual_satisfied = std::min(allocate, demand_before);
-                did_remain_amount[did] = demand_before - actual_satisfied;
-                remain = 0;
+    for (int sid = 0; sid < static_cast<int>(sid_remainpv.size()); ++sid) {
+        if (++processed_supply % 1000 == 0) {
+            auto now = clock::now();
+            double elapsed = std::chrono::duration<double>(now - time_start).count();
+            if (elapsed > cutoff_seconds) {
+                std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
+                timed_out = 1;
                 break;
             }
         }
+        int &remain = sid_remainpv[sid];
+        if (remain <= 0) continue;
 
-        if (!timed_out) {
-            std::cout << "在线 FIFO 分配完成。" << std::endl;
-        }
-    }
-
-    void sls_model::LSout_online(const std::string& online_res_file)
-    {
-        std::ofstream fout(online_res_file);
-        if (!fout.is_open()) {
-            std::cerr << "无法打开文件 " << online_res_file << " 进行写入。" << std::endl;
-            return;
-        }
-        fout << "sid,demand,allocated_pv\n";
-        for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
-            const std::string &sid_str = index_sid[sid];
-            for (const auto &kv : sid_did_allocatepv[sid]) {
-                int did = kv.first;
-                int pv = kv.second;
-                const std::string &did_str = index_did[did];
-                fout << sid_str << "," << did_str << "," << pv << "\n";
+        int best_did = -1;
+        int best_remain_amount = -1;
+        
+        for (int did : sid_did[sid]) {
+            if (did >= static_cast<int>(did_online_mask.size())) continue;
+            if (did_online_mask[did] == 0) continue;
+            int demand_remaining = did_remain_amount[did];
+            if (demand_remaining > best_remain_amount) {
+                best_remain_amount = demand_remaining;
+                best_did = did;
             }
         }
-        fout.close();
-        std::cout << "Online allocation results in file " << online_res_file << "\n";
+        
+        if (best_did != -1) {
+            int allocate = remain;
+            sid_did_allocatepv[sid][best_did] += allocate;
+            origin_gain_online += allocate;
+
+            int demand_before = did_remain_amount[best_did];
+            int actual_satisfied = std::min(allocate, demand_before);
+            did_remain_amount[best_did] = demand_before - actual_satisfied;
+            remain = 0;
+        }
     }
 
-    void sls_model::compute_and_log_online_metrics()
-    {
-        long long unsat = 0;
-        for (int rem : did_remain_amount) {
-            unsat += rem;
-        }
-        double pen = static_cast<double>(unsat) * 1000.0;
-        double gain = static_cast<double>(origin_gain_online) - pen;
-        unsatisfied_total = unsat;
-        penalty = pen;
-        gain_metric = gain;
-        std::cout << "Online metrics: origin_gain=" << origin_gain_online
-                  << ", penalty=" << pen
-                  << ", gain=" << gain
-                  << ", unsatisfied_total=" << unsat << std::endl;
-        std::cout << "OBJ: " << gain << std::endl;
-        // std::cout<< "test1"<<std::endl;
+    if (!timed_out) {
+        std::cout << "在线 FIFO 分配完成。" << std::endl;
     }
+}
+
+    void sls_model::LSout_online(const std::string& online_res_file)
+{
+    // Post-processing: reallocate remaining supply to reduce penalty
+    for (size_t sid = 0; sid < sid_remainpv.size(); ++sid) {
+        if (sid_remainpv[sid] <= 0) continue;
+        
+        // Find online demands connected to this supply that are still unsatisfied
+        for (int did : sid_did[sid]) {
+            if (did < 0 || did >= static_cast<int>(did_online_mask.size())) continue;
+            if (did_online_mask[did] == 0) continue;
+            if (did_remain_amount[did] <= 0) continue;
+            
+            // Allocate remaining supply to reduce unsatisfied demand
+            int allocate = std::min(sid_remainpv[sid], did_remain_amount[did]);
+            if (allocate > 0) {
+                sid_did_allocatepv[sid][did] += allocate;
+                sid_remainpv[sid] -= allocate;
+                did_remain_amount[did] -= allocate;
+                origin_gain_online += allocate; // Update gain metric
+            }
+            if (sid_remainpv[sid] == 0) break;
+        }
+    }
+    
+    std::ofstream fout(online_res_file);
+    if (!fout.is_open()) {
+        std::cerr << "无法打开文件 " << online_res_file << " 进行写入。" << std::endl;
+        return;
+    }
+    fout << "sid,demand,allocated_pv\n";
+    for (size_t sid = 0; sid < sid_did_allocatepv.size(); ++sid) {
+        const std::string &sid_str = index_sid[sid];
+        for (const auto &kv : sid_did_allocatepv[sid]) {
+            int did = kv.first;
+            int pv = kv.second;
+            const std::string &did_str = index_did[did];
+            fout << sid_str << "," << did_str << "," << pv << "\n";
+        }
+    }
+    fout.close();
+    std::cout << "Online allocation results in file " << online_res_file << "\n";
+}
+
+    void sls_model::compute_and_log_online_metrics()
+{
+    long long unsat = 0;
+    for (int rem : did_remain_amount) {
+        unsat += rem;
+    }
+    
+    // Compute total initial demand for adaptive scaling
+    long long total_initial_demand = 0;
+    for (const auto& kv : demand_id_amount) {
+        total_initial_demand += kv.second;
+    }
+    
+    double pen = 0.0;
+    if (total_initial_demand > 0) {
+        // Adaptive penalty scaling based on unsatisfied ratio
+        const double alpha = 1.0;  // Scaling factor
+        double unsat_ratio = static_cast<double>(unsat) / static_cast<double>(total_initial_demand);
+        double adaptive_factor = 1.0 + alpha * unsat_ratio;
+        pen = static_cast<double>(unsat) * 1000.0 * adaptive_factor;
+    } else {
+        pen = static_cast<double>(unsat) * 1000.0;
+    }
+    
+    double gain = static_cast<double>(origin_gain_online) - pen;
+    unsatisfied_total = unsat;
+    penalty = pen;
+    gain_metric = gain;
+    std::cout << "Online metrics: origin_gain=" << origin_gain_online
+              << ", penalty=" << pen
+              << ", gain=" << gain
+              << ", unsatisfied_total=" << unsat 
+              << ", total_initial_demand=" << total_initial_demand << std::endl;
+    std::cout << "OBJ: " << gain << std::endl;
+}
 
 
 
@@ -838,8 +1025,19 @@ namespace solver
         std::vector<double> r = c;
 
         std::cout << "[RAP] (in-memory) 开始对偶子梯度迭代（时间限制："<<time_limit<<"秒）" << std::endl;
+        
+        // 引入自适应步长调整因子
+        double adaptive_factor = 1.0;
+        const double min_factor = 0.1;
+        const double max_factor = 10.0;
+        const int adapt_window = 100;
+        double prev_obj = std::numeric_limits<double>::max();
+        int non_improving_count = 0;
+        
         for (int t = 0; ; ++t) {
-            double alpha = alpha0 / std::sqrt((double)(t + 1));
+            double alpha = (alpha0 / std::sqrt((double)(t + 1))) * adaptive_factor;
+            
+            // 引入轻微随机扰动避免局部最优
             std::vector<double> x_prev = x;
             for (int j = 0; j < n; ++j) {
                 if (w[j] > 0.0) {
@@ -848,8 +1046,10 @@ namespace solver
                     if (zj > ub[j]) zj = ub[j];
                     x[j] = zj;
                 } else {
-                    if (r[j] > 0.0) x[j] = lb[j];
-                    else if (r[j] < 0.0) x[j] = ub[j];
+                    // 添加小随机扰动促进探索
+                    double perturbed_r = r[j] + ((rand() % 100) / 10000.0 - 0.005) * adaptive_factor;
+                    if (perturbed_r > 0.0) x[j] = lb[j];
+                    else if (perturbed_r < 0.0) x[j] = ub[j];
                     else x[j] = x_prev[j];
                 }
             }
@@ -891,6 +1091,29 @@ namespace solver
                 double viol = std::max(0.0, -s_ineq[i]);
                 if (viol > max_ineq_viol) max_ineq_viol = viol;
             }
+            
+            // 自适应步长调整逻辑
+            if (t % adapt_window == 0 && t > 0) {
+                double quad = 0.0;
+                for (int j = 0; j < n; ++j) quad += w[j] * x[j] * x[j];
+                double obj = 0.5 * quad;
+                for (int j = 0; j < n; ++j) obj += c[j] * x[j];
+                
+                if (obj >= prev_obj - tol) {
+                    non_improving_count++;
+                    if (non_improving_count >= 2) {
+                        // 连续多个窗口没有改进，减小步长以稳定
+                        adaptive_factor = std::max(min_factor, adaptive_factor * 0.8);
+                        non_improving_count = 0;
+                    }
+                } else {
+                    // 目标改进，适度增加步长加速
+                    adaptive_factor = std::min(max_factor, adaptive_factor * 1.1);
+                    non_improving_count = 0;
+                }
+                prev_obj = obj;
+            }
+            
             if (t % 1000 == 0) {
                 double quad = 0.0;
                 for (int j = 0; j < n; ++j) quad += w[j] * x[j] * x[j];
@@ -898,7 +1121,8 @@ namespace solver
                 for (int j = 0; j < n; ++j) obj += c[j] * x[j];
                 std::cout << "[RAP] iter=" << t << " obj=" << obj
                         << " max_eq_viol=" << max_eq_viol
-                        << " max_ineq_viol=" << max_ineq_viol << std::endl;
+                        << " max_ineq_viol=" << max_ineq_viol 
+                        << " adapt=" << adaptive_factor << std::endl;
                 auto current_time = std::chrono::steady_clock::now();
                 auto elapsed_time = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
                 if (elapsed_time >= time_limit) {

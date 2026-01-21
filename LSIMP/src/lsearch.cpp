@@ -576,8 +576,12 @@ void LsSolver::insertOperatorOnCons(const Int consIndex) {
 bool LsSolver::doFeasibleSatOperator() {
     _operatorPool.clear();
 
+    // Shuffle objective variables to break deterministic patterns
+    vector<Variable> shuffledVars = _objectiveVars;
+    util::shuffleRandomly(shuffledVars);
+
     Set<Int> visitedConsIndex;
-    for (const Variable& var : _objectiveVars) {
+    for (const Variable& var : shuffledVars) {
         // insertSatOperatorOnVar(var);
 
         if (checkOperator(var, _assignment.getLB(var))) {
@@ -870,7 +874,16 @@ bool LsSolver::selectOperatorAndMove(Float minScore) {
 
     Int  poolSize = _operatorPool.size();
     // bool bmsFlag  = poolSize < _options._bmsThreshold ? false : true;
-    Int  smpCnt   = std::min(_options._bmsThreshold, poolSize);
+    Int  baseSmpCnt   = std::min(_options._bmsThreshold, poolSize);
+
+    // Dynamic sample size based on stagnation detection
+    static Int consecutiveFailures = 0;
+    Int smpCnt = baseSmpCnt;
+    if (consecutiveFailures > 0) {
+        // Increase sample size when stagnated (failed to find a move)
+        Int extraSamples = (consecutiveFailures / 3) * (baseSmpCnt / 2);
+        smpCnt = std::min(baseSmpCnt + extraSamples, poolSize);
+    }
 
     if (DEBUG && _options._printStep) cout << "Operator Pool Size: " << poolSize << "  smpCnt: " << smpCnt << endl;
 
@@ -905,9 +918,13 @@ bool LsSolver::selectOperatorAndMove(Float minScore) {
         << ")  " << bestVar << " -> " << bestValue << endl;
     if (bestScore > minScore) {
         setVarWithNewVal(bestVar, bestValue);
+        // Reset failure counter on successful move
+        consecutiveFailures = 0;
         // cout << "Move: " << bestVar << " -> " << bestValue << endl;
         return true;
     } 
+    // Increment failure counter when no move is found
+    consecutiveFailures++;
     return false;
 }
 
@@ -936,10 +953,54 @@ Float LsSolver::clacHardScore(Variable var, Int val) const {
         bool postSat = judgeLimitOpVal(limit, op, postValue);
 
         if (preSat && !postSat) {       // sat -> unsat 
-            score -= _consWeight[consIndex];
+            // Penalize based on how much the constraint becomes violated
+            Float violation = 0;
+            if (op == Op::GEQUAL) {
+                violation = limit - postValue;  // positive when limit > postValue
+            } else if (op == Op::LEQUAL) {
+                violation = postValue - limit;  // positive when postValue > limit
+            }
+            if (violation > 0) {
+                // Scale penalty by relative violation magnitude
+                // Add small epsilon to avoid division by zero
+                Float normalizedViolation = violation / (fabs(static_cast<Float>(limit)) + 1e-6);
+                score -= _consWeight[consIndex] * (1.0 + normalizedViolation);
+            }
         } 
         else if (!preSat && postSat) {  // unsat -> sat
-            score += _consWeight[consIndex];
+            // Reward based on how much the constraint was violated before
+            Float violation = 0;
+            if (op == Op::GEQUAL) {
+                violation = limit - preValue;  // positive when limit > preValue
+            } else if (op == Op::LEQUAL) {
+                violation = preValue - limit;  // positive when preValue > limit
+            }
+            if (violation > 0) {
+                // Scale reward by relative violation magnitude that was fixed
+                Float normalizedViolation = violation / (fabs(static_cast<Float>(limit)) + 1e-6);
+                score += _consWeight[consIndex] * (1.0 + normalizedViolation);
+            }
+        }
+        else if (!preSat && !postSat) {  // unsat -> unsat (but violation might change)
+            // Consider the change in violation magnitude even if constraint remains unsatisfied
+            Float preViolation = 0, postViolation = 0;
+            if (op == Op::GEQUAL) {
+                preViolation = limit - preValue;
+                postViolation = limit - postValue;
+            } else if (op == Op::LEQUAL) {
+                preViolation = preValue - limit;
+                postViolation = postValue - limit;
+            }
+            
+            // Both should be positive since constraint is unsatisfied
+            if (preViolation > 0 && postViolation > 0) {
+                Float violationImprovement = preViolation - postViolation;
+                if (violationImprovement != 0) {
+                    // Reward reduction in violation, penalize increase in violation
+                    Float normalizedImprovement = violationImprovement / (fabs(static_cast<Float>(limit)) + 1e-6);
+                    score += _consWeight[consIndex] * normalizedImprovement;
+                }
+            }
         }
     }
     return score;
@@ -947,11 +1008,10 @@ Float LsSolver::clacHardScore(Variable var, Int val) const {
 
 Float LsSolver::clacSoftScore(Variable var, Int val) const {
     Float coef  = calcVarCoefOnPoly(_formula->getObjectiveFunction(), var);
-    Float score = coef * (val - getVarAssign(var));       // minimize objective function
-
-    if (score < 0) return 1.0 * _objectWeight;
-    else if (score > 0) return -1.0 * _objectWeight;
-    else return 0;
+    Float delta = coef * (val - getVarAssign(var));       // objective change
+    
+    // Proportional scoring: scale by actual improvement magnitude
+    return -delta * _objectWeight;                       // negative for improvement, positive for worsening
 }
 
 /**
@@ -1142,7 +1202,17 @@ void LsSolver::updateConstraintWeight() {
         if (JUDGE) assert(_consValue.at(consIndex) == calcConsValue(cons));
         if (JUDGE) assert(!judgeLimitOpVal(cons.getLimit(), cons.getOp(), _consValue.at(consIndex)));
 
-        _consWeight[consIndex]++;
+        // Adaptive weight increment based on violation magnitude
+        Int violationGap = 0;
+        if (cons.getOp() == Op::GEQUAL) {
+            violationGap = cons.getLimit() - _consValue[consIndex];
+        } else if (cons.getOp() == Op::LEQUAL) {
+            violationGap = _consValue[consIndex] - cons.getLimit();
+        }
+        // Increment by at least 1, but scale with gap (capped to avoid explosion)
+        const Int MAX_GAP_INC = 10;
+        Int inc = 1 + std::min(violationGap, MAX_GAP_INC) / 2;
+        _consWeight[consIndex] += inc;
     }
 
     // update objective weight

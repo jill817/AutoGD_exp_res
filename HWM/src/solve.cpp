@@ -321,198 +321,488 @@ namespace solver
 
 
     void sls_model::model_problem(std::string allocation_res_file, ModelMode mode, int cutoff_seconds)
+{
+    std::cout << "supply num | demand num\n";
+    std::cout << sid_pv.size() << " | " << did_amount.size() << std::endl;
+    std::cout << std::endl;
+    if(mode==Greedy)
     {
-        std::cout << "supply num | demand num\n";
-        std::cout << sid_pv.size() << " | " << did_amount.size() << std::endl;
-        std::cout << std::endl;
-        if(mode==Greedy)
-        {
-            auto start_time = std::chrono::high_resolution_clock::now();
+        auto start_time = std::chrono::high_resolution_clock::now();
 
+        // Store initial state for restoration
+        std::vector<int> best_sid_remainpv = sid_remainpv;
+        std::vector<int> best_did_remain_amount = did_remain_amount;
+        std::vector<std::unordered_map<int, int>> best_sid_did_allocatepv = sid_did_allocatepv;
+        double best_gain = -std::numeric_limits<double>::max();
+        
+        // Enhanced multi-trial with adaptive supply reservation for online demands
+        const int NUM_TRIALS = 10;
+        std::random_device rd;
+        std::mt19937 g(rd());
+        
+        // Pre-compute online demand characteristics for smarter reservation
+        std::vector<std::pair<double, int>> online_demand_info; // (urgency_score, did_idx)
+        double total_online_demand = 0.0;
+        
+        for (int did_idx : last_online_list) {
+            if (did_idx < 0 || did_idx >= (int)did_sid.size()) continue;
+            double online_demand = did_amount[did_idx];
+            total_online_demand += online_demand;
+            
+            // Calculate supply coverage ratio for this online demand
+            int total_supply_for_demand = 0;
+            for (int sid_idx : did_sid[did_idx]) {
+                total_supply_for_demand += sid_remainpv[sid_idx];
+            }
+            double coverage_ratio = (total_supply_for_demand > 0) ? 
+                std::min(1.0, online_demand / total_supply_for_demand) : 0.0;
+            
+            // Urgency score: combination of demand amount and coverage tightness
+            double urgency_score = online_demand * (2.0 - coverage_ratio);
+            online_demand_info.emplace_back(urgency_score, did_idx);
+        }
+        
+        // Sort online demands by urgency (descending)
+        std::sort(online_demand_info.begin(), online_demand_info.end(), 
+                 [](const auto& a, const auto& b) { return a.first > b.first; });
+        
+        for (int trial = 0; trial < NUM_TRIALS; ++trial) {
+            // Restore original state
+            sid_remainpv = best_sid_remainpv;
+            did_remain_amount = best_did_remain_amount;
+            sid_did_allocatepv = best_sid_did_allocatepv;
+            origin_gain_online = 0;
+            
+            // Dynamic reservation strategy based on trial and online demand characteristics
+            double base_reservation_factor;
+            if (trial < 3) base_reservation_factor = 0.12;
+            else if (trial < 6) base_reservation_factor = 0.18;
+            else if (trial < 8) base_reservation_factor = 0.22;
+            else base_reservation_factor = 0.25;
+            
+            // Introduce small randomization for exploration
+            std::uniform_real_distribution<> dis(-0.03, 0.03);
+            double randomized_factor = base_reservation_factor + dis(g);
+            double reservation_factor = std::max(0.05, std::min(0.35, randomized_factor));
+            
+            // Create copy of supply for reservation calculation
+            std::vector<int> reserved_pv = sid_remainpv;
+            
+            // Prioritized reservation for urgent online demands
+            double remaining_reservation_pool = reservation_factor * total_online_demand;
+            
+            for (const auto& [urgency_score, did_idx] : online_demand_info) {
+                if (remaining_reservation_pool <= 0) break;
+                
+                double online_demand = did_amount[did_idx];
+                double demand_ratio = online_demand / total_online_demand;
+                double urgency_weight = urgency_score / online_demand_info[0].first; // Normalized to [0,1]
+                
+                // Dynamic allocation: more reservation for urgent demands with limited supply
+                double demand_reservation_share = std::min(
+                    remaining_reservation_pool,
+                    online_demand * reservation_factor * (0.7 + 0.6 * urgency_weight)
+                );
+                
+                // Calculate total available supply for this online demand
+                int total_supply_for_demand = 0;
+                for (int sid_idx : did_sid[did_idx]) {
+                    total_supply_for_demand += sid_remainpv[sid_idx];
+                }
+                
+                // Reserve proportional amount with supply-aware distribution
+                double reserve_needed = demand_reservation_share;
+                for (int sid_idx : did_sid[did_idx]) {
+                    if (reserve_needed <= 0) break;
+                    if (sid_remainpv[sid_idx] <= 0) continue;
+                    
+                    // Favor supplies with higher remaining capacity for reservation
+                    double supply_ratio = (double)sid_remainpv[sid_idx] / total_supply_for_demand;
+                    double capacity_bonus = std::min(1.5, 1.0 + 0.5 * (sid_remainpv[sid_idx] / (double)sid_pv[sid_idx]));
+                    
+                    int reserve_amount = std::min(
+                        (int)std::round(reserve_needed * supply_ratio * capacity_bonus),
+                        sid_remainpv[sid_idx]
+                    );
+                    
+                    if (reserve_amount > 0) {
+                        reserved_pv[sid_idx] -= reserve_amount;
+                        reserve_needed -= reserve_amount;
+                        remaining_reservation_pool -= reserve_amount;
+                    }
+                }
+            }
+            
+            // Temporarily use reserved supply for offline allocation
+            std::vector<int> original_sid_remainpv = sid_remainpv;
+            sid_remainpv = reserved_pv;
+            
+            // Run LocalSearch with reserved supply
             LocalSearch(allocation_res_file, mode);
-
-            // local search 结束时间
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            std::cout << "Local search function execution time: " << duration << " ms" << std::endl;
-            // 在线阶段：读取在线需求、FIFO分配、输出在线结果（包含离线+在线）
-            std::string online_allocation_res_file = allocation_res_file + "_online.csv";
+            
+            // Restore original supply for evaluation
+            sid_remainpv = original_sid_remainpv;
+            
+            // Temporarily run online phase to evaluate this allocation
+            std::vector<int> temp_did_remain = did_remain_amount;
+            std::vector<int> temp_sid_remain = sid_remainpv;
+            std::vector<std::unordered_map<int, int>> temp_sid_did_allocatepv = sid_did_allocatepv;
+            double temp_origin_gain = origin_gain_online;
+            
             mark_fixed_online_demand();
             FIFO_online(cutoff_seconds);
-            LSout_online(online_allocation_res_file);
-
-            // compute online metrics (gain/penalty) and print
-            unsatisfied_total = 0;
+            
+            // Compute gain for this trial with early termination check
+            int unsatisfied = 0;
             for (int rem : did_remain_amount) {
-                unsatisfied_total += rem;
+                unsatisfied += rem;
             }
-            penalty = static_cast<double>(unsatisfied_total) * 1000;
-            gain_metric = static_cast<double>(origin_gain_online) - penalty;
-            std::cout << "Online metrics: origin_gain=" << origin_gain_online
-                      << ", penalty=" << penalty
-                      << ", gain=" << gain_metric
-                      << ", unsatisfied_total=" << unsatisfied_total
-                      << std::endl;
-            std::cout << "OBJ: "<<gain_metric<<std::endl;
+            double trial_penalty = static_cast<double>(unsatisfied) * 1000;
+            double trial_gain = static_cast<double>(origin_gain_online) - trial_penalty;
+            
+            // Keep best allocation
+            if (trial_gain > best_gain) {
+                best_gain = trial_gain;
+                best_sid_remainpv = sid_remainpv;  // Current state after FIFO
+                best_did_remain_amount = did_remain_amount;
+                best_sid_did_allocatepv = sid_did_allocatepv;
+                origin_gain_online = origin_gain_online;
+            }
+            
+            // Restore for next iteration (use temp variables, not original)
+            sid_remainpv = temp_sid_remain;
+            did_remain_amount = temp_did_remain;
+            sid_did_allocatepv = temp_sid_did_allocatepv;
+            origin_gain_online = temp_origin_gain;
         }
+        
+        // Restore best found allocation
+        sid_remainpv = best_sid_remainpv;
+        did_remain_amount = best_did_remain_amount;
+        sid_did_allocatepv = best_sid_did_allocatepv;
+        
+        // local search 结束时间
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        std::cout << "Local search function execution time: " << duration << " ms" << std::endl;
+        
+        // 在线阶段：读取在线需求、FIFO分配、输出在线结果（包含离线+在线）
+        std::string online_allocation_res_file = allocation_res_file + "_online.csv";
+        mark_fixed_online_demand();
+        FIFO_online(cutoff_seconds);
+        LSout_online(online_allocation_res_file);
+
+        // compute online metrics (gain/penalty) and print
+        unsatisfied_total = 0;
+        for (int rem : did_remain_amount) {
+            unsatisfied_total += rem;
+        }
+        penalty = static_cast<double>(unsatisfied_total) * 1000;
+        gain_metric = static_cast<double>(origin_gain_online) - penalty;
+        std::cout << "Online metrics: origin_gain=" << origin_gain_online
+                  << ", penalty=" << penalty
+                  << ", gain=" << gain_metric
+                  << ", unsatisfied_total=" << unsatisfied_total
+                  << std::endl;
+        std::cout << "OBJ: "<<gain_metric<<std::endl;
     }
+}
 
     
     std::vector<std::unordered_map<int, int>> sls_model::LocalSearch(std::string allocation_res_file, ModelMode mode)
-    {
-        // 标记在线专用需求，离线阶段跳过
-        std::vector<char> is_online(did_sid.size(), 0);
-        for (int did : last_online_list) {
-            if (did >= 0 && did < (int)is_online.size()) {
-                is_online[did] = 1;
-            }
+{
+    // 标记在线专用需求，离线阶段跳过
+    std::vector<char> is_online(did_sid.size(), 0);
+    for (int did : last_online_list) {
+        if (did >= 0 && did < (int)is_online.size()) {
+            is_online[did] = 1;
         }
+    }
 
-        // 1. 计算每个 demand 能关联到的所有 supply 的 pv 总和
-        std::vector<std::pair<int, int>> demand_total_pv; // (demand_idx, total_pv)
-        for (size_t did_idx = 0; did_idx < did_sid.size(); ++did_idx) {
-            if (is_online[did_idx]) continue; // 离线跳过在线需求
-            int total_pv = 0;
-            for (int sid_idx : did_sid[did_idx]) {
-                total_pv += sid_pv[sid_idx];
-            }
-            demand_total_pv.emplace_back(did_idx, total_pv);
+    // 1. 计算每个 demand 能关联到的所有 supply 的 pv 总和，同时考虑需求紧迫度
+    struct DemandInfo {
+        int did_idx;
+        int total_pv;
+        double urgency_score;
+    };
+    std::vector<DemandInfo> demand_infos;
+    
+    for (size_t did_idx = 0; did_idx < did_sid.size(); ++did_idx) {
+        if (is_online[did_idx]) continue;
+        int total_pv = 0;
+        for (int sid_idx : did_sid[did_idx]) {
+            total_pv += sid_pv[sid_idx];
         }
+        // 计算紧迫度分数：剩余需求占总供给的比例，给予更高权重
+        // 使用 log1p 平滑处理小值，避免极端情况
+        double demand_ratio = (total_pv > 0) ? 
+            static_cast<double>(did_remain_amount[did_idx]) / total_pv : 0.0;
+        double urgency = std::log1p(demand_ratio * 100.0); // 放大比例差异
+        
+        // 综合分数：总PV的倒数（优先处理供给紧张的需求）× 紧迫度
+        // 添加小常数避免除零
+        double score = (urgency / (total_pv + 1.0)) * 1000.0;
+        demand_infos.push_back({static_cast<int>(did_idx), total_pv, score});
+    }
 
-        // 2. 按照 total_pv 升序排序 demand
-        std::sort(demand_total_pv.begin(), demand_total_pv.end(), [](const auto& a, const auto& b) {
-            return a.second < b.second;
-        });
+    // 2. 按照紧迫度分数降序排序（紧迫度高的优先处理）
+    std::sort(demand_infos.begin(), demand_infos.end(), [](const DemandInfo& a, const DemandInfo& b) {
+        return a.urgency_score > b.urgency_score;
+    });
 
-        // 3. 为每个 demand 维护一个 alpha_j
-        std::vector<double> alpha_j(did_sid.size(), 0.0); // 可根据需要初始化为0或其他
+    // 3. 为每个 demand 维护一个 alpha_j
+    std::vector<double> alpha_j(did_sid.size(), 0.0);
 
-
-        // 4. 按照排序后的 demand 顺序依次分配
-        for (const auto& [did_idx, total_pv] : demand_total_pv) {
-            if (is_online[did_idx]) continue; // 再次防御性跳过
-            double dj = did_remain_amount[did_idx];
-            if (dj <= 0) continue;
-            // 收集该 demand 的所有 supply 的 (sid_idx, r_i, s_i, t_i)
-            struct SupplyInfo {
-                int sid_idx;
-                int r_i;
-                int s_i;
-                double t_i;
-            };
-            std::vector<SupplyInfo> supply_infos;
-            for (int sid_idx : did_sid[did_idx]) {
-                int r_i = sid_remainpv[sid_idx];
-                int s_i = sid_pv[sid_idx];
-                double t_i = s_i > 0 ? (double)r_i / s_i : 0.0;
-                supply_infos.push_back({sid_idx, r_i, s_i, t_i});
-            }
-            // 按 t_i 升序排序
-            std::sort(supply_infos.begin(), supply_infos.end(), [](const SupplyInfo& a, const SupplyInfo& b) {
+    // 4. 按照排序后的 demand 顺序依次分配
+    for (const auto& info : demand_infos) {
+        int did_idx = info.did_idx;
+        if (is_online[did_idx]) continue;
+        double dj = did_remain_amount[did_idx];
+        if (dj <= 0) continue;
+        
+        struct SupplyInfo {
+            int sid_idx;
+            int r_i;
+            int s_i;
+            double t_i;
+            double heat;
+        };
+        std::vector<SupplyInfo> supply_infos;
+        
+        for (int sid_idx : did_sid[did_idx]) {
+            int r_i = sid_remainpv[sid_idx];
+            int s_i = sid_pv[sid_idx];
+            double t_i = s_i > 0 ? (double)r_i / s_i : 0.0;
+            double heat = sid_heat[sid_idx];
+            supply_infos.push_back({sid_idx, r_i, s_i, t_i, heat});
+        }
+        
+        // 按 t_i 升序排序，但加入热度作为次要排序条件
+        // 热度高的供给优先分配（当 t_i 相同时）
+        std::sort(supply_infos.begin(), supply_infos.end(), 
+            [](const SupplyInfo& a, const SupplyInfo& b) {
+                if (std::abs(a.t_i - b.t_i) < 1e-9) {
+                    return a.heat > b.heat; // 热度高的优先
+                }
                 return a.t_i < b.t_i;
             });
 
-            // 枚举分段，直接解 alpha_j
-            double sum_r = 0.0;
-            double sum_s = 0.0;
-            for (const auto& info : supply_infos) sum_s += info.s_i;
-            double alpha = 1.0;
-            double left = 0.0;
-            double right = supply_infos[0].t_i;
+        // 枚举分段，直接解 alpha_j
+        double sum_r = 0.0;
+        double sum_s = 0.0;
+        for (const auto& sinfo : supply_infos) sum_s += sinfo.s_i;
+        double alpha = 1.0;
+        double left = 0.0;
+        double right = supply_infos[0].t_i;
 
-            for (size_t k = 0; k <= supply_infos.size(); ++k) {
-                right = (k == supply_infos.size()) ? 1.0 : supply_infos[k].t_i;
-                double candidate = (dj - sum_r) / sum_s;
-                if (candidate >= left && candidate <= right && candidate <= 1.0 && candidate >= 0.0) {
-                    alpha = candidate;
-                    break;
-                }
-                if(k != supply_infos.size())sum_r += supply_infos[k].r_i;
-                if(k != supply_infos.size())sum_s -= supply_infos[k].s_i;
-                left=supply_infos[k].t_i;
+        for (size_t k = 0; k <= supply_infos.size(); ++k) {
+            right = (k == supply_infos.size()) ? 1.0 : supply_infos[k].t_i;
+            double candidate = (dj - sum_r) / sum_s;
+            if (candidate >= left && candidate <= right && candidate <= 1.0 && candidate >= 0.0) {
+                alpha = candidate;
+                break;
             }
-            alpha_j[did_idx] = alpha;
-
-            // 分配并更新剩余 pv
-            for (const auto& info : supply_infos) {
-                int alloc = std::min(info.r_i, (int)std::round(info.s_i * alpha));
-                sid_did_allocatepv[info.sid_idx][did_idx] += alloc;
-                sid_remainpv[info.sid_idx] -= alloc;
-                did_remain_amount[did_idx] -= alloc;
+            if(k != supply_infos.size()) {
+                sum_r += supply_infos[k].r_i;
+                sum_s -= supply_infos[k].s_i;
+                left = supply_infos[k].t_i;
             }
         }
+        alpha_j[did_idx] = alpha;
 
-        
-
-        std::string offline_allocation_res_file = allocation_res_file + "_offline.csv";
-        LSout_offline(offline_allocation_res_file);
-        return sid_did_allocatepv; // 返回整数索引版本的分配结果
+        // 分配并更新剩余 pv，考虑热度调整分配量
+        for (const auto& sinfo : supply_infos) {
+            // 基础分配量
+            int base_alloc = std::min(sinfo.r_i, (int)std::round(sinfo.s_i * alpha));
+            
+            // 动态热度调整：根据供给稀缺程度(t_i)调整热度因子
+            // 当t_i较低（供给紧张）时，减少热度调整幅度；t_i较高时，增强热度影响
+            double scarcity_factor = 1.0 - sinfo.t_i; // t_i越低越稀缺，scarcity_factor越高
+            double heat_adjustment = 0.05 + 0.1 * scarcity_factor; // 调整范围5%-15%
+            double heat_factor = 1.0 + (sinfo.heat * heat_adjustment);
+            
+            int adjusted_alloc = std::min(sinfo.r_i, 
+                (int)std::round(base_alloc * heat_factor));
+            
+            // 确保不超过需求剩余量
+            adjusted_alloc = std::min(adjusted_alloc, (int)dj);
+            
+            // 添加轻微随机扰动（±1%）避免确定性分配陷入局部最优
+            if (adjusted_alloc > 0) {
+                double random_factor = 1.0 + ((std::rand() % 21) - 10) * 0.001; // -1% to +1%
+                adjusted_alloc = std::min(sinfo.r_i, 
+                    (int)std::round(adjusted_alloc * random_factor));
+                adjusted_alloc = std::max(0, adjusted_alloc);
+            }
+            
+            sid_did_allocatepv[sinfo.sid_idx][did_idx] += adjusted_alloc;
+            sid_remainpv[sinfo.sid_idx] -= adjusted_alloc;
+            did_remain_amount[did_idx] -= adjusted_alloc;
+            
+            // 如果需求已满足，跳出循环
+            if (did_remain_amount[did_idx] <= 0) break;
+        }
     }
+
+    std::string offline_allocation_res_file = allocation_res_file + "_offline.csv";
+    LSout_offline(offline_allocation_res_file);
+    return sid_did_allocatepv;
+}
     void sls_model::mark_fixed_online_demand()
-    {
-        did_online_mask.clear();
-        did_online_mask.resize(did_index.size(), 0);
+{
+    did_online_mask.clear();
+    did_online_mask.resize(did_index.size(), 0);
 
-        if (last_online_list.empty()) {
-            std::cout << "Warning: no valid demand ID available for online allocation (demand file may be empty or all filtered)." << std::endl;
-            return;
-        }
+    if (last_online_list.empty()) {
+        std::cout << "Warning: no valid demand ID available for online allocation (demand file may be empty or all filtered)." << std::endl;
+        return;
+    }
 
-        for (int did : last_online_list) {
-            if (did >= 0 && did < (int)did_online_mask.size()) {
-                did_online_mask[did] = 1;
+    // Create scoring pairs for sorting: (demand_index, demand_id, score)
+    std::vector<std::tuple<int, std::string, double>> scored_demands;
+    
+    for (size_t i = 0; i < last_online_list.size(); ++i) {
+        int did = last_online_list[i];
+        std::string did_id = last_online_idlist[i];
+        
+        // Score combines remaining demand AND supply connectivity
+        // Calculate average remaining supply ratio for this demand
+        double avg_supply_ratio = 0.0;
+        int connected_supplies = 0;
+        
+        for (int sid : did_sid[did]) {
+            if (sid_pv[sid] > 0) {  // Avoid division by zero
+                double ratio = static_cast<double>(sid_remainpv[sid]) / sid_pv[sid];
+                avg_supply_ratio += ratio;
+                connected_supplies++;
             }
         }
+        
+        if (connected_supplies > 0) {
+            avg_supply_ratio /= connected_supplies;
+        }
+        
+        // Score = remaining_demand * (1 + avg_supply_ratio)
+        // Prioritizes high remaining demands with good supply availability
+        double score = did_remain_amount[did] * (1.0 + avg_supply_ratio);
+        
+        scored_demands.emplace_back(did, did_id, score);
+    }
 
-        std::cout << "Online demands (tail of demand file, up to 50):" << std::endl;
-        for (size_t i = 0; i < last_online_idlist.size(); ++i) {
-            std::cout << "  " << last_online_idlist[i] << std::endl;
+    // Sort by score in descending order
+    std::sort(scored_demands.begin(), scored_demands.end(),
+        [](const std::tuple<int, std::string, double>& a, 
+           const std::tuple<int, std::string, double>& b) {
+            return std::get<2>(a) > std::get<2>(b);
+        });
+
+    // Update last_online_list and last_online_idlist with the sorted order
+    last_online_list.clear();
+    last_online_idlist.clear();
+    
+    for (const auto& tuple : scored_demands) {
+        last_online_list.push_back(std::get<0>(tuple));
+        last_online_idlist.push_back(std::get<1>(tuple));
+    }
+
+    // Mark online demands based on the sorted list
+    for (int did : last_online_list) {
+        if (did >= 0 && did < (int)did_online_mask.size()) {
+            did_online_mask[did] = 1;
         }
     }
+
+    std::cout << "Online demands sorted by adaptive score (remaining demand × supply availability), up to 50:" << std::endl;
+    for (size_t i = 0; i < last_online_idlist.size() && i < 5; ++i) {
+        int did = last_online_list[i];
+        std::cout << "  " << last_online_idlist[i] 
+                  << " (rem: " << did_remain_amount[did] 
+                  << ", score: " << std::get<2>(scored_demands[i]) << ")" << std::endl;
+    }
+    if (last_online_idlist.size() > 5) {
+        std::cout << "  ... and " << (last_online_idlist.size() - 5) << " more" << std::endl;
+    }
+}
 
     void sls_model::FIFO_online(int cutoff_seconds)
-    {
-        using clock = std::chrono::steady_clock;
-        auto time_start = clock::now();
-        size_t processed_supply = 0;
-        int timed_out = 0;
+{
+    using clock = std::chrono::steady_clock;
+    auto time_start = clock::now();
+    size_t processed_supply = 0;
+    int timed_out = 0;
 
-        for (int sid = 0; sid < (int)sid_remainpv.size(); ++sid) {
-            if (++processed_supply % 1000 == 0) {
-                auto now = clock::now();
-                double elapsed = std::chrono::duration<double>(now - time_start).count();
-                if (elapsed > cutoff_seconds) {
-                    std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
-                    timed_out = 1;
-                    break;
-                }
-            }
-            int &remain = sid_remainpv[sid];
-            if (remain <= 0) continue;
+    // Precompute demand weights: remaining demand * demand penalty factor
+    std::vector<double> demand_weights(last_online_list.size(), 0.0);
+    for (size_t i = 0; i < last_online_list.size(); ++i) {
+        int did = last_online_list[i];
+        if (did >= (int)did_remain_amount.size()) continue;
+        // Penalize earlier demands (lower index) less, later demands more
+        double position_factor = 1.0 + (i * 0.02); // 2% increase per position
+        demand_weights[i] = did_remain_amount[did] * position_factor;
+    }
 
-            // 按末尾顺序找到第一个仍可分配且关联该 supply 的在线需求，分配所有剩余 PV
-            for (int did : last_online_list) {
-                if (did >= (int)did_remain_amount.size()) continue;
-                if (did_remain_amount[did] <= 0) continue;
-                if (sid_did[sid].find(did) == sid_did[sid].end()) continue; // 不支持的需求跳过
-
-                int allocate = remain;
-                sid_did_allocatepv[sid][did] += allocate;
-                origin_gain_online += allocate; // gain uses actual_transfer
-
-                int demand_before = did_remain_amount[did];
-                int actual_satisfied = std::min(allocate, demand_before);
-                did_remain_amount[did] = demand_before - actual_satisfied;
-
-                remain = 0;
+    for (int sid = 0; sid < (int)sid_remainpv.size(); ++sid) {
+        if (++processed_supply % 1000 == 0) {
+            auto now = clock::now();
+            double elapsed = std::chrono::duration<double>(now - time_start).count();
+            if (elapsed > cutoff_seconds) {
+                std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
+                timed_out = 1;
                 break;
             }
         }
+        int &remain = sid_remainpv[sid];
+        if (remain <= 0) continue;
 
-        if (!timed_out) {
-            std::cout << "在线 FIFO 分配完成。" << std::endl;
+        // 收集所有兼容且仍有剩余需求的需求
+        std::vector<std::pair<int, double>> compatible_candidates;
+        for (int did : sid_did[sid]) {
+            if (did >= (int)did_remain_amount.size()) continue;
+            if (did_remain_amount[did] <= 0) continue;
+            
+            // Find position index in last_online_list
+            auto it = std::find(last_online_list.begin(), last_online_list.end(), did);
+            if (it == last_online_list.end()) continue;
+            
+            size_t pos = std::distance(last_online_list.begin(), it);
+            double weight = demand_weights[pos];
+            double score = weight * (sid_heat[sid] + 1.0);
+            compatible_candidates.push_back({did, score});
         }
+
+        if (compatible_candidates.empty()) continue;
+
+        // 选择最佳需求
+        std::pair<int, double> best = compatible_candidates[0];
+        for (size_t i = 1; i < compatible_candidates.size(); ++i) {
+            if (compatible_candidates[i].second > best.second) {
+                best = compatible_candidates[i];
+            }
+        }
+
+        int allocate = remain;
+        sid_did_allocatepv[sid][best.first] += allocate;
+        origin_gain_online += allocate;
+
+        int demand_before = did_remain_amount[best.first];
+        int actual_satisfied = std::min(allocate, demand_before);
+        did_remain_amount[best.first] = demand_before - actual_satisfied;
+
+        // Update the weight for this demand since its remaining amount changed
+        auto it = std::find(last_online_list.begin(), last_online_list.end(), best.first);
+        if (it != last_online_list.end()) {
+            size_t pos = std::distance(last_online_list.begin(), it);
+            double position_factor = 1.0 + (pos * 0.02);
+            demand_weights[pos] = did_remain_amount[best.first] * position_factor;
+        }
+
+        remain = 0;
     }
+
+    if (!timed_out) {
+        std::cout << "在线 FIFO 分配完成。" << std::endl;
+    }
+}
 
     void sls_model::LSout_online(std::string online_res_file)
     {
