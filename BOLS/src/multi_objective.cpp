@@ -383,15 +383,14 @@ bool MultiObjectiveData::change_supply_sat_state(bool old_state, bool new_state,
     return true;
 }
 
-bool MultiObjectiveData::change_assignment(long long supply, long long supply_position, long long demand, long long new_val){
+bool MultiObjectiveData::change_assignment(long long supply, long long supply_position, long long demand, long long new_val) {
     allocateVar &assign = assign_supply2demand[supply][supply_position];
     long long old_value = assign.allocate_value;
-    long long value_change = new_val -old_value;
+    long long value_change = new_val - old_value;
     
     bool demand_sat = check_demand_sat_state(demand);
     bool supply_sat = check_supply_sat_state(supply);
 
-    //cout << supply << "  " << demand << "  " << old_value << "  " << new_val << "  " << value_change << endl;
     demand_remain[demand] -= value_change;
     supply_remain[supply] -= value_change;
     assign.allocate_value = new_val;
@@ -399,25 +398,65 @@ bool MultiObjectiveData::change_assignment(long long supply, long long supply_po
     bool new_demand_state = check_demand_sat_state(demand);
     bool new_supply_state = check_supply_sat_state(supply);
     
-    if (demand_sat != new_demand_state){
-        //cout << unsat_demand << endl;
-        //cout << demand_sat << "   " << new_demand_state << endl;
+    if (demand_sat != new_demand_state) {
         change_demand_sat_state(demand_sat, new_demand_state, demand);
     }
-    if (supply_sat != new_supply_state){
-        //cout << supply_sat << "   " << new_supply_state << endl;
+    if (supply_sat != new_supply_state) {
         change_supply_sat_state(supply_sat, new_supply_state, supply);
     }
 
-    if (obj1_supply_flag[supply] == 1){
+    if (obj1_supply_flag[supply] == 1) {
         obj1_available_query_supply += value_change;
-        if (supply_remain[supply] != supply_value[supply]){
+        
+        // Enhanced query supply management with adaptive thresholds
+        long long current_remain = supply_remain[supply];
+        long long supply_capacity = supply_value[supply];
+        
+        // Only update query_supply_not_full when status meaningfully changes
+        bool currently_full = (current_remain == supply_capacity);
+        bool previously_full = (current_remain - value_change == supply_capacity);
+        
+        if (!currently_full && previously_full) {
+            // Transition from full to not full: add if not exists
+            if (!query_supply_not_full.exist(supply)) {
+                query_supply_not_full.push_back(supply);
+            }
+        } else if (currently_full && !previously_full) {
+            // Transition from not full to full: remove if exists
+            if (query_supply_not_full.exist(supply)) {
+                query_supply_not_full.remove(supply);
+            }
+        }
+        // Maintain invariant: supplies with remaining capacity > 0 stay in container
+        else if (!currently_full && current_remain > 0 && !query_supply_not_full.exist(supply)) {
             query_supply_not_full.push_back(supply);
         }
-        if (supply_remain[supply] == supply_value[supply]){
-            if (query_supply_not_full.exist(supply)) query_supply_not_full.remove(supply);
+    }
+    
+    // Adaptive objective adjustment based on global and local state
+    if (value_change != 0) {
+        // Update demand and supply weights based on remaining proportions
+        // to prioritize unsatisfied constraints dynamically
+        if (demand_value[demand] > 0) {
+            double demand_ratio = std::abs(static_cast<double>(demand_remain[demand]) / demand_value[demand]);
+            weight_demand[demand] = 1 + static_cast<long long>(1000 * demand_ratio);
+        }
+        
+        if (supply_value[supply] > 0) {
+            double supply_ratio = std::abs(static_cast<double>(supply_remain[supply]) / supply_value[supply]);
+            weight_supply[supply] = 1 + static_cast<long long>(1000 * supply_ratio);
+        }
+        
+        // Adjust global objective weight based on saturation progress
+        if (unsat_demand + unsat_supply > 0) {
+            double progress = 1.0 - static_cast<double>(unsat_demand + unsat_supply) / (demand_cnt + supply_cnt);
+            weight_obj1 = std::max(0.1, 1.0 - progress * 0.5);  // Gradually reduce obj1 weight
+        } else {
+            // During optimization phase, restore full weight for objective trade-off
+            weight_obj1 = 1.0;
         }
     }
+    
     return true;
 }
 
@@ -641,19 +680,24 @@ void MultiObjectiveData::do_sat_constraint_move_new(){
                 long long posi_in_supply = allocat_position_in_supply[demand][posi_in_demand];
                 allocateVar var_2 = assign_supply2demand[supply_2][posi_in_supply];
                 
-                long long trans_val = rand() % (var.allocate_value + 1);
-                if (trans_val > supply_exceed) trans_val = supply_exceed;
-                // long long trans_val = std::min({supply_exceed, supply_remain[supply_2], var.allocate_value});
+                // Modified: Replace random transfer value with deterministic calculation
+                // Consider both feasibility and proportional reduction
+                long long trans_val = 0;
+                if (supply_remain[supply_2] > 0) {
+                    // Choose the minimum among: supply exceedance, available capacity in supply_2, and current allocation
+                    trans_val = std::min({supply_exceed, supply_remain[supply_2], var.allocate_value});
+                    // Additionally, consider proportional reduction to avoid overly aggressive moves
+                    if (trans_val > 1) {
+                        // Scale down to at most half of the exceedance for smoother convergence
+                        trans_val = std::min(trans_val, supply_exceed / 2);
+                    }
+                }
+                // If supply_2 is also over-allocated, skip this candidate
 
-                // if (trans_val > 0){
-                //     change_assignment(supply, position, demand, var.allocate_value - trans_val);
-                //     change_assignment(supply_2, posi_in_supply, demand, var_2.allocate_value + trans_val);
-                //     if (check_supply_sat_state(supply)) break;
-                // }
                 double cur_score = calcu_2step_operator_score_new(var, var_2, trans_val);
                 //cout << "try: supply1: " << var.supply_index << " supply2: " << var_2.supply_index << " demand: " << var.demand_index << " " << var_2.demand_index  << " trans_val: " << trans_val << " " << var.allocate_value << endl;
 
-                if (cur_score > best_score){
+                if (cur_score > best_score && trans_val > 0){
                     best_score      = cur_score;
                     best_trans_val  = trans_val;
                     best_var1 = var;
@@ -743,48 +787,88 @@ bool supply_choice_cmp(Supply_choice s1, Supply_choice s2){
 //     return ;
 // }
 
-void MultiObjectiveData::do_improve_balance_move(){
+void MultiObjectiveData::do_improve_balance_move()
+{
+    // Create shuffled demand indices to randomize processing order
+    vector<long long> demand_indices(demand_cnt);
+    for (long long i = 0; i < demand_cnt; ++i) demand_indices[i] = i;
+    for (long long i = 0; i < demand_cnt; ++i) {
+        long long j = rand() % demand_cnt;
+        std::swap(demand_indices[i], demand_indices[j]);
+    }
 
-    for(long long demand_index = 0; demand_index < demand_cnt; demand_index++){
-        long long available_supply_all = 0;
+    for (long long idx = 0; idx < demand_cnt; ++idx) {
+        long long demand_index = demand_indices[idx];
         vector<balance_coefficient> balance_vec;
 
-        for(std::size_t i = 0; i < map_demand2supply[demand_index].size(); i++){
-
+        for (std::size_t i = 0; i < map_demand2supply[demand_index].size(); ++i) {
             long long supply_index1 = map_demand2supply[demand_index][i];
-            long long position      = allocat_position_in_supply[demand_index][i];
+            long long position = allocat_position_in_supply[demand_index][i];
             double coef = obj2_const_coef[supply_index1][position];
 
             if (obj1_supply_flag[supply_index1] == 1) continue;
-            
+
             balance_coefficient balance_coef;
             balance_coef.val = (double)coef;
             balance_coef.demand_index = demand_index;
             balance_coef.supply_index = supply_index1;
             balance_coef.position = position;
             balance_vec.push_back(balance_coef);
-
-            available_supply_all += (supply_remain[supply_index1] + assign_supply2demand[supply_index1][position].allocate_value);
         }
 
-        std::sort(balance_vec.begin(),balance_vec.end(),cmp_balance_coef);
-        long long demand_use = 0;
+        std::sort(balance_vec.begin(), balance_vec.end(), cmp_balance_coef);
 
-        for (balance_coefficient balance_coef : balance_vec){
-            change_assignment(balance_coef.supply_index, balance_coef.position, balance_coef.demand_index, 0);
+        double total_coef = 0.0;
+        for (const auto& balance_coef : balance_vec) {
+            total_coef += balance_coef.val;
         }
 
-        for (balance_coefficient balance_coef : balance_vec){
-            if (demand_remain[demand_index] <= 0) break;
-            
-            else {
-                long long bal_val = round(balance_coef.val);
-                long long val = std::max(bal_val,(long long)1);
-                val = std::min({val, demand_remain[balance_coef.demand_index], supply_remain[balance_coef.supply_index]});
-                if (val != assign_supply2demand[balance_coef.supply_index][balance_coef.position].allocate_value){
-                    change_assignment(balance_coef.supply_index, balance_coef.position, balance_coef.demand_index, val);
+        if (total_coef <= 0 || balance_vec.empty()) continue;
+
+        for (balance_coefficient balance_coef : balance_vec) {
+            if (demand_remain[demand_index] <= 0 && supply_remain[balance_coef.supply_index] <= 0) continue;
+
+            long long current_alloc = assign_supply2demand[balance_coef.supply_index][balance_coef.position].allocate_value;
+            double ideal_proportion = balance_coef.val / total_coef;
+            long long target = round(ideal_proportion * demand_value[demand_index]);
+            target = std::max(target, (long long)0);
+            long long delta = target - current_alloc;
+
+            // Skip if no adjustment needed
+            if (delta == 0) continue;
+
+            // Use random step size between 1 and max_step for exploration
+            long long max_step = std::max((long long)1, demand_value[demand_index] / 100);
+            long long step = (rand() % max_step) + 1;
+            if (delta > 0) {
+                delta = std::min(delta, step);
+            } else {
+                delta = std::max(delta, -step);
+            }
+
+            long long new_val = current_alloc + delta;
+
+            // Apply capacity constraints
+            if (delta > 0) {
+                long long max_increase = std::min(supply_remain[balance_coef.supply_index], demand_remain[demand_index]);
+                new_val = current_alloc + std::min(delta, max_increase);
+            } else if (delta < 0) {
+                new_val = std::max(current_alloc + delta, (long long)0);
+            }
+
+            if (new_val != current_alloc && new_val >= 0) {
+                if (delta > 0) {
+                    long long final_val = std::min({new_val,
+                                                   supply_remain[balance_coef.supply_index] + current_alloc,
+                                                   demand_remain[demand_index] + current_alloc});
+                    if (final_val != current_alloc) {
+                        change_assignment(balance_coef.supply_index, balance_coef.position,
+                                         balance_coef.demand_index, final_val);
+                    }
+                } else {
+                    change_assignment(balance_coef.supply_index, balance_coef.position,
+                                     balance_coef.demand_index, new_val);
                 }
-                demand_use += val;
             }
         }
     }
@@ -874,6 +958,30 @@ long long MultiObjectiveData::calcu_operator_score(allocateVar var, long long va
     if (obj1_supply_flag[supply] == 1){
         score = score - val_change * weight_obj1;
     }
+    
+    // Add objective 2 influence: penalize deviation from objective 2 coefficient
+    // Find the position of this variable in the supply's list
+    long long position = -1;
+    for (long long i = 0; i < map_supply2demand[supply].size(); i++) {
+        if (map_supply2demand[supply][i] == demand) {
+            position = i;
+            break;
+        }
+    }
+    
+    if (position != -1) {
+        double obj2_coef = obj2_const_coef[supply][position];
+        // Calculate absolute deviation from objective 2 coefficient
+        double old_deviation = std::abs(var_old_val - obj2_coef);
+        double new_deviation = std::abs(var_val_new - obj2_coef);
+        // Improvement in objective 2 (negative means worse)
+        double obj2_delta = old_deviation - new_deviation;
+        
+        // Scale to balance with other objectives (using existing weight_obj1 as reference)
+        // The factor 0.1 ensures objective 2 has influence but doesn't dominate
+        score += static_cast<long long>(obj2_delta * weight_obj1 * 0.1);
+    }
+    
     cout << "score cal: " << var.allocate_value << "  " << var_val_new << " " << score << endl;
     return score;
 }
@@ -920,31 +1028,113 @@ long long MultiObjectiveData::calcu_2step_operator_score(allocateVar &var1, allo
 }
 
 long long MultiObjectiveData::calcu_2step_operator_score_new(allocateVar &var1, allocateVar &var2, long long trans_val){
-    long long score = 0;
+    double score = 0.0;
     long long var1_supply = var1.supply_index;
     long long var2_supply = var2.supply_index;
-    bool var1_supply_state = check_supply_sat_state(var1_supply);
-    bool var2_supply_state = check_supply_sat_state(var2_supply);
+    long long var1_demand = var1.demand_index;
+    long long var2_demand = var2.demand_index;
     long long var1_val_new = var1.allocate_value - trans_val;
     long long var2_val_new = var2.allocate_value + trans_val;
 
+    // Original remain-rate balance term - improve by using relative change
     double remain_rate_s1_before = supply_remain[var1_supply] / supply_value[var1_supply];
     double remain_rate_s2_before = supply_remain[var2_supply] / supply_value[var2_supply];
     double remain_rate_s1_after  = (supply_remain[var1_supply] + trans_val) / supply_value[var1_supply];
     double remain_rate_s2_after  = (supply_remain[var2_supply] - trans_val) / supply_value[var2_supply];
+    
+    // Use squared difference for stronger penalty on imbalance
+    double before_diff = remain_rate_s1_before - remain_rate_s2_before;
+    double after_diff = remain_rate_s1_after - remain_rate_s2_after;
+    score += (before_diff * before_diff - after_diff * after_diff) * 100; // Scale up for better sensitivity
 
-    score += abs(remain_rate_s1_before - remain_rate_s2_before) - abs(remain_rate_s1_after - remain_rate_s2_after);
-
-    if (unsat_demand == 0 && unsat_supply == 0){
-        if (obj1_supply_flag[var1_supply] == 1 && obj1_supply_flag[var2_supply] == 0){
-            score += weight_obj1 * trans_val;
+    // Find positions to access obj2_const_coef
+    long long pos1 = -1, pos2 = -1;
+    for (long long idx = 0; idx < map_demand2supply[var1_demand].size(); ++idx) {
+        if (map_demand2supply[var1_demand][idx] == var1_supply) {
+            pos1 = allocat_position_in_supply[var1_demand][idx];
+            break;
         }
-        if (obj1_supply_flag[var1_supply] == 0 && obj1_supply_flag[var2_supply] == 1){
-            score -= weight_obj1 * trans_val;
+    }
+    for (long long idx = 0; idx < map_demand2supply[var2_demand].size(); ++idx) {
+        if (map_demand2supply[var2_demand][idx] == var2_supply) {
+            pos2 = allocat_position_in_supply[var2_demand][idx];
+            break;
         }
     }
 
-    return score;
+    // State-dependent weight scaling based on constraint satisfaction
+    double constraint_weight = 1.0;
+    if (unsat_demand > 0 || unsat_supply > 0) {
+        long long total_constraints = demand_cnt + supply_cnt;
+        long long unsat_total = unsat_demand + unsat_supply;
+        double sat_ratio = 1.0 - (double)unsat_total / total_constraints;
+        constraint_weight = sat_ratio * sat_ratio; // Quadratic decay
+    }
+
+    // Incorporate objective 2 influence with demand balance consideration
+    if (pos1 != -1 && pos2 != -1) {
+        double obj2_coef1 = obj2_const_coef[var1_supply][pos1];
+        double obj2_coef2 = obj2_const_coef[var2_supply][pos2];
+        double obj2_before = abs(var1.allocate_value - obj2_coef1) + abs(var2.allocate_value - obj2_coef2);
+        double obj2_after = abs(var1_val_new - obj2_coef1) + abs(var2_val_new - obj2_coef2);
+        score += (obj2_before - obj2_after) * 10 * constraint_weight;  // Weighted by constraint satisfaction
+        
+        // Add demand satisfaction consideration
+        if (var1_demand != var2_demand) {
+            double demand_rate1_before = demand_remain[var1_demand] / demand_value[var1_demand];
+            double demand_rate2_before = demand_remain[var2_demand] / demand_value[var2_demand];
+            double demand_rate1_after = (demand_remain[var1_demand] + trans_val) / demand_value[var1_demand];
+            double demand_rate2_after = (demand_remain[var2_demand] - trans_val) / demand_value[var2_demand];
+            
+            double demand_imbalance_before = abs(demand_rate1_before - demand_rate2_before);
+            double demand_imbalance_after = abs(demand_rate1_after - demand_rate2_after);
+            score += (demand_imbalance_before - demand_imbalance_after) * 50 * constraint_weight; // Weighted balance
+        }
+    }
+
+    // Enhanced adaptive objective 1 term with progressive weighting
+    if (unsat_demand == 0 && unsat_supply == 0) {
+        // Full weight when constraints satisfied
+        double obj1_weight = weight_obj1;
+        if (obj1_supply_flag[var1_supply] == 1 && obj1_supply_flag[var2_supply] == 0) {
+            score += obj1_weight * trans_val * 1.5; // Boost for query supply reduction
+        }
+        if (obj1_supply_flag[var1_supply] == 0 && obj1_supply_flag[var2_supply] == 1) {
+            // Penalize less when moving to query supply if it improves objective 2 significantly
+            double penalty_reduction = 0.0;
+            if (pos1 != -1 && pos2 != -1) {
+                double obj2_coef1 = obj2_const_coef[var1_supply][pos1];
+                double obj2_coef2 = obj2_const_coef[var2_supply][pos2];
+                double obj2_improvement = abs(var1.allocate_value - obj2_coef1) - abs(var1_val_new - obj2_coef1);
+                penalty_reduction = std::max(0.0, obj2_improvement * 2.0);
+            }
+            score -= (obj1_weight * trans_val - penalty_reduction);
+        }
+    } else {
+        // Progressive weight reduction based on constraint violation severity
+        long long total_constraints = demand_cnt + supply_cnt;
+        long long unsat_total = unsat_demand + unsat_supply;
+        double sat_ratio = 1.0 - (double)unsat_total / total_constraints;
+        double adaptive_weight = weight_obj1 * sat_ratio * sat_ratio; // Quadratic decay for stronger focus on constraints
+        
+        // Additional boost for moves that directly address constraint violations
+        double constraint_boost = 0.0;
+        if (supply_remain[var1_supply] < 0 && supply_remain[var2_supply] > 0) {
+            constraint_boost = 100.0 * std::min(trans_val, -supply_remain[var1_supply]);
+        }
+        if (demand_remain[var1_demand] > 0 && demand_remain[var2_demand] < 0) {
+            constraint_boost = 100.0 * std::min(trans_val, demand_remain[var1_demand]);
+        }
+        
+        if (obj1_supply_flag[var1_supply] == 1 && obj1_supply_flag[var2_supply] == 0) {
+            score += adaptive_weight * trans_val + constraint_boost;
+        }
+        if (obj1_supply_flag[var1_supply] == 0 && obj1_supply_flag[var2_supply] == 1) {
+            score -= adaptive_weight * trans_val - constraint_boost;
+        }
+    }
+
+    return static_cast<long long>(score);
 }
 
 
@@ -1393,55 +1583,162 @@ int MultiObjectiveData::objective_order(){
     else return 1;
 }
 
-bool MultiObjectiveData::do_2step_improve_move(){
-
+bool MultiObjectiveData::do_2step_improve_move()
+{
+    static double temperature = 1000.0;
+    const double cooling_rate = 0.95;
+    
     allocateVar best_var1, best_var2;
 
     for (int i = 0; i <= BMS; i++){
 
-        if (i == BMS) return false;
-        if (query_supply_not_full.empty()) return false;
+        if (i == BMS) {
+            temperature *= cooling_rate;
+            return false;
+        }
+        if (query_supply_not_full.empty()) {
+            temperature *= cooling_rate;
+            return false;
+        }
 
-        long long index = rand() % query_supply_not_full.size();
-        long long supply_out = query_supply_not_full[index];
+        // Intelligent selection: prioritize query supplies with higher deviation from target
+        long long supply_out = -1;
+        if (temperature > 500.0) {
+            // Exploration phase: random selection
+            long long index = rand() % query_supply_not_full.size();
+            supply_out = query_supply_not_full[index];
+        } else {
+            // Exploitation phase: select supply with worst objective 2 deviation
+            double max_deviation = -1.0;
+            for (size_t idx = 0; idx < query_supply_not_full.size(); idx++) {
+                long long s = query_supply_not_full[idx];
+                for (size_t pos = 0; pos < map_supply2demand[s].size(); pos++) {
+                    double dev = abs(assign_supply2demand[s][pos].allocate_value - 
+                                   obj2_const_coef[s][pos]);
+                    if (dev > max_deviation) {
+                        max_deviation = dev;
+                        supply_out = s;
+                    }
+                }
+            }
+            if (supply_out == -1) {
+                long long index = rand() % query_supply_not_full.size();
+                supply_out = query_supply_not_full[index];
+            }
+        }
 
         if (map_supply2demand[supply_out].size() == 0) continue; 
-        long long pos1 = rand() % map_supply2demand[supply_out].size();
-        long long demand = map_supply2demand[supply_out][pos1];
-        if (map_demand2supply[demand].size() == 0)continue;
-
-        index = rand() % map_demand2supply[demand].size();
-
-        long long remain_size = map_demand2supply[demand].size();
-        long long pos2 = allocat_position_in_supply[demand][index];
-        long long supply_in = map_demand2supply[demand][index];
         
+        // Select demand with largest current allocation from this supply
+        long long demand = -1;
+        long long pos1 = -1;
+        long long max_alloc = -1;
+        for (size_t p = 0; p < map_supply2demand[supply_out].size(); p++) {
+            long long d = map_supply2demand[supply_out][p];
+            long long alloc = assign_supply2demand[supply_out][p].allocate_value;
+            if (alloc > max_alloc) {
+                max_alloc = alloc;
+                demand = d;
+                pos1 = p;
+            }
+        }
+        
+        if (demand == -1 || map_demand2supply[demand].size() == 0) continue;
 
+        // Select supply_in with lowest deviation from target
+        long long supply_in = -1;
+        long long pos2 = -1;
+        double best_improvement = -1e9;
+        
+        // Try multiple candidate supplies for better selection
+        int num_candidates = std::min(5, (int)map_demand2supply[demand].size());
+        for (int attempt = 0; attempt < num_candidates; attempt++) {
+            long long index = rand() % map_demand2supply[demand].size();
+            long long candidate_supply = map_demand2supply[demand][index];
+            long long candidate_pos = allocat_position_in_supply[demand][index];
+            
+            if (candidate_supply == supply_out) continue;
+            if (obj1_supply_flag[candidate_supply] == 1) continue;
+            
+            allocateVar var1 = assign_supply2demand[supply_out][pos1];
+            allocateVar var2 = assign_supply2demand[candidate_supply][candidate_pos];
+            
+            if (var1.allocate_value == 0) continue;
+            
+            // Enhanced transfer amount calculation considering both objectives
+            long long max_transfer = std::min(var1.allocate_value, supply_remain[candidate_supply]);
+            if (max_transfer <= 0) continue;
+            
+            double coef1 = obj2_const_coef[supply_out][pos1];
+            double coef2 = obj2_const_coef[candidate_supply][candidate_pos];
+            
+            // Calculate optimal transfer for objective 2
+            double optimal_val_double = (var1.allocate_value - coef1 - var2.allocate_value + coef2) / 2.0;
+            long long optimal_transfer = std::llround(optimal_val_double);
+            optimal_transfer = std::max((long long)1, std::min(optimal_transfer, max_transfer));
+            
+            // Adjust for objective 1 benefit (transfer from query to non-query supply)
+            double obj1_weight = 0.1 * (temperature / 1000.0); // Weight decreases with temperature
+            long long adjusted_transfer = std::max((long long)1, 
+                std::min((long long)(optimal_transfer * (1.0 + obj1_weight)), max_transfer));
+            
+            // Calculate potential improvement
+            double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - adjusted_transfer - coef1);
+            double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + adjusted_transfer - coef2);
+            double total_improvement = diff1 + diff2 + (obj1_weight * adjusted_transfer);
+            
+            if (total_improvement > best_improvement) {
+                best_improvement = total_improvement;
+                supply_in = candidate_supply;
+                pos2 = candidate_pos;
+            }
+        }
+        
+        if (supply_in == -1) continue;
+        
         allocateVar var1 = assign_supply2demand[supply_out][pos1];
         allocateVar var2 = assign_supply2demand[supply_in][pos2];
-
-        long long val_trans = std::max(var1.allocate_value / remain_size, (long long)1);
-
+        
+        // Final transfer amount calculation
+        long long max_transfer = std::min(var1.allocate_value, supply_remain[supply_in]);
         double coef1 = obj2_const_coef[supply_out][pos1];
         double coef2 = obj2_const_coef[supply_in][pos2];
-        double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - val_trans - coef1);
-        double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + val_trans - coef2);
-
-        if (obj1_supply_flag[supply_in] == 1) continue;
-        if (var1.allocate_value == 0)continue;
-        if(supply_in == supply_out) continue;
-        if (diff1 + diff2 < 0) continue;
         
-        long long best_trans_val = val_trans;
-        long long best_pos1 = pos1;
-        long long best_pos2 = pos2;
-        best_var1 = var1;
-        best_var2 = var2;
-
-        change_assignment(best_var1.supply_index, best_pos1, best_var1.demand_index, best_var1.allocate_value - best_trans_val);
-        change_assignment(best_var2.supply_index, best_pos2, best_var2.demand_index, best_var2.allocate_value + best_trans_val);
-        break;
+        double optimal_val_double = (var1.allocate_value - coef1 - var2.allocate_value + coef2) / 2.0;
+        long long optimal_transfer = std::llround(optimal_val_double);
+        optimal_transfer = std::max((long long)1, std::min(optimal_transfer, max_transfer));
+        
+        // Adaptive acceptance threshold
+        double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - optimal_transfer - coef1);
+        double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + optimal_transfer - coef2);
+        double delta = diff1 + diff2;
+        
+        // Temperature-dependent acceptance threshold
+        double threshold = -0.1 * temperature;
+        if (delta >= threshold) {
+            // Probabilistic acceptance even for slightly negative moves
+            if (delta < 0) {
+                double acceptance_prob = exp(delta / temperature);
+                double random_val = (double)rand() / RAND_MAX;
+                if (random_val > acceptance_prob) {
+                    continue;
+                }
+            }
             
+            long long best_trans_val = optimal_transfer;
+            long long best_pos1 = pos1;
+            long long best_pos2 = pos2;
+            best_var1 = var1;
+            best_var2 = var2;
+
+            change_assignment(best_var1.supply_index, best_pos1, best_var1.demand_index, 
+                             best_var1.allocate_value - best_trans_val);
+            change_assignment(best_var2.supply_index, best_pos2, best_var2.demand_index, 
+                             best_var2.allocate_value + best_trans_val);
+            
+            temperature *= cooling_rate;
+            break;
+        }
     }
 
     assert(unsat_demand == 0);
@@ -1515,7 +1812,13 @@ bool MultiObjectiveData::do_2step_reduce_move_new(){
         long long demand = map_supply2demand[supply_out][pos1];
         if (map_demand2supply[demand].size() == 0)continue;
 
-        for (index = 0; index < map_demand2supply[demand].size(); index++){
+        // Pre-shuffle destination supplies to improve exploration
+        vector<long long> dest_indices(map_demand2supply[demand].size());
+        for (long long idx = 0; idx < map_demand2supply[demand].size(); ++idx) dest_indices[idx] = idx;
+        std::random_shuffle(dest_indices.begin(), dest_indices.end());
+
+        for (long long idx = 0; idx < dest_indices.size(); idx++){
+            index = dest_indices[idx];
             long long remain_size = map_demand2supply[demand].size();
 
             long long pos2 = allocat_position_in_supply[demand][index];
@@ -1527,33 +1830,74 @@ bool MultiObjectiveData::do_2step_reduce_move_new(){
             if (obj1_supply_flag[supply_in] == 1) continue;
             if (var1.allocate_value == 0)continue;
 
-            long long val_trans = std::max(var1.allocate_value / remain_size, (long long)1);
-
+            // Dynamic transfer value based on allocation error and capacity
             double coef1 = obj2_const_coef[supply_out][pos1];
             double coef2 = obj2_const_coef[supply_in][pos2];
-            double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - val_trans - coef1);
-            double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + val_trans - coef2);
+            long long err1 = abs(var1.allocate_value - coef1);
+            long long err2 = abs(var2.allocate_value - coef2);
+            
+            // Base transfer value considers remaining capacity and error gradient
+            long long val_trans = std::max(var1.allocate_value / remain_size, (long long)1);
+            long long capacity_bound = supply_remain[supply_in];
+            long long error_adjust = std::max((err1 - err2) / 2, (long long)1);
+            val_trans = std::min({val_trans, capacity_bound, error_adjust});
+            if (val_trans <= 0) continue;
+
+            // Try multiple transfer values with adaptive stepping
+            long long val_options[3] = {val_trans, std::max(val_trans/2, (long long)1), 
+                                       std::max(val_trans/4, (long long)1)};
+            long long chosen_val = 0;
+            double best_delta2 = -1e9;
+            
+            for (int opt = 0; opt < 3; opt++) {
+                long long try_val = val_options[opt];
+                if (try_val > var1.allocate_value) continue;
+                
+                double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - try_val - coef1);
+                double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + try_val - coef2);
+                double delta2 = diff1 + diff2;
+                
+                if (delta2 > best_delta2) {
+                    best_delta2 = delta2;
+                    chosen_val = try_val;
+                }
+            }
+            
+            if (chosen_val == 0) continue;
+            
+            double diff1 = abs(var1.allocate_value - coef1) - abs(var1.allocate_value - chosen_val - coef1);
+            double diff2 = abs(var2.allocate_value - coef2) - abs(var2.allocate_value + chosen_val - coef2);
             double delta2 = diff1 + diff2;
-
-            double score = val_trans / abs(delta2);
-
+            
+            // Enhanced scoring with multi-objective balancing
+            double obj1_improvement = weight_obj1 * chosen_val;  // Reducing query supply usage
+            double normalized_delta2 = delta2 / (abs(delta2) + 1e-9);
+            double score = normalized_delta2 + obj1_improvement * 0.1;
+            
+            // Additional term to favor moves that reduce large errors
+            double error_reduction = (err1 - abs(var1.allocate_value - chosen_val - coef1)) * 0.05;
+            score += error_reduction;
+            
             if (score > best_score){
                 find_best_flag = true;
                 best_score = score;
-                best_trans_val = val_trans;
+                best_trans_val = chosen_val;
                 best_pos1 = pos1;
                 best_pos2 = pos2;
                 best_var1 = var1;
                 best_var2 = var2;
-                if (delta2 > 0) break;
+                // Early exit for strongly improving moves
+                if (delta2 > 0 && score > 1.0) break;
             }
         }
     }
 
     assert(unsat_demand == 0);
     if (find_best_flag == true){
-        change_assignment(best_var1.supply_index, best_pos1, best_var1.demand_index, best_var1.allocate_value - best_trans_val);
-        change_assignment(best_var2.supply_index, best_pos2, best_var2.demand_index, best_var2.allocate_value + best_trans_val);
+        change_assignment(best_var1.supply_index, best_pos1, best_var1.demand_index, 
+                         best_var1.allocate_value - best_trans_val);
+        change_assignment(best_var2.supply_index, best_pos2, best_var2.demand_index, 
+                         best_var2.allocate_value + best_trans_val);
         return true;
     }
     else{

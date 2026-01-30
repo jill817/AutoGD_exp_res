@@ -587,53 +587,161 @@ namespace solver
     }
 
     std::vector<std::string> sls_model::choose_online_demand_ids(int online_top_k) const
-    {
-        std::vector<std::string> targets;
-        if (online_top_k <= 0) {
-            return targets;
-        }
-
-        int remaining = online_top_k;
-        for (auto it = demand_read_order.rbegin(); it != demand_read_order.rend() && remaining > 0; ++it) {
-            if (did_index.count(*it)) {
-                targets.push_back(*it);
-                --remaining;
-            }
-        }
+{
+    std::vector<std::string> targets;
+    if (online_top_k <= 0) {
         return targets;
     }
 
-    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x, int online_top_k)
-    {
-        reset_allocation_state();
-        std::vector<std::string> online_targets = choose_online_demand_ids(online_top_k);
-        std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
-        for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
-            int alloc = static_cast<int>(std::round(x[i]));
-            if (alloc <= 0) continue;
-            const std::string &var = var_list[i];
-            if (var.size() < 3 || var[0] != 'x' || var[1] != '_') continue;
-            std::vector<std::string> parts;
-            std::string var_copy = var;
-            split(var_copy, parts, '_');
-            if (parts.size() != 4) continue; // 只处理 x_user_supply_demand
-            const std::string user_orig = user_id_convert_rev[parts[1]];
-            const std::string supply_orig = supply_id_convert_rev[parts[2]];
-            const std::string demand_orig = demand_id_convert_rev[parts[3]];
-            if (!online_target_set.empty() && online_target_set.count(demand_orig)) {
-                continue; // leave for online phase
-            }
-            std::string sid = user_orig + "_" + supply_orig;
-            auto sid_it = sid_index.find(sid);
-            auto did_it = did_index.find(demand_orig);
-            if (sid_it == sid_index.end() || did_it == did_index.end()) continue;
-            int sid_idx = sid_it->second;
-            int did_idx = did_it->second;
-            sid_did_allocatepv[sid_idx][did_idx] += alloc;
-            sid_remainpv[sid_idx] = std::max(0, sid_remainpv[sid_idx] - alloc);
-            did_remain_amount[did_idx] = std::max(0, did_remain_amount[did_idx] - alloc);
+    // Collect valid demand IDs that exist in supply data
+    std::vector<std::string> valid_demands;
+    for (const auto& demand_id : demand_read_order) {
+        if (did_index.count(demand_id)) {
+            valid_demands.push_back(demand_id);
         }
     }
+
+    // Sort by demand amount in descending order (highest amounts first)
+    std::sort(valid_demands.begin(), valid_demands.end(),
+        [this](const std::string& a, const std::string& b) {
+            // Note: demand_id_amount contains all demands from file
+            return demand_id_amount.at(a) > demand_id_amount.at(b);
+        });
+
+    // Select top k demands
+    int remaining = std::min(online_top_k, static_cast<int>(valid_demands.size()));
+    targets.insert(targets.end(), valid_demands.begin(), valid_demands.begin() + remaining);
+
+    return targets;
+}
+
+    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x, int online_top_k)
+{
+    reset_allocation_state();
+    std::vector<std::string> online_targets = choose_online_demand_ids(online_top_k);
+    std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
+    
+    // First pass: collect and score variables
+    std::vector<std::tuple<double, size_t, std::string, std::string>> scored_vars; // (score, index, sid, did)
+    std::unordered_map<std::string, double> demand_continuous_total;
+    std::unordered_map<std::string, double> supply_continuous_total;
+    
+    for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
+        double x_val = x[i];
+        if (x_val <= 0) continue;
+        const std::string &var = var_list[i];
+        if (var.size() < 3 || var[0] != 'x' || var[1] != '_') continue;
+        
+        std::vector<std::string> parts;
+        std::string var_copy = var;
+        split(var_copy, parts, '_');
+        if (parts.size() != 4) continue;
+        
+        const std::string user_orig = user_id_convert_rev[parts[1]];
+        const std::string supply_orig = supply_id_convert_rev[parts[2]];
+        const std::string demand_orig = demand_id_convert_rev[parts[3]];
+        
+        if (!online_target_set.empty() && online_target_set.count(demand_orig)) {
+            continue;
+        }
+        
+        std::string sid = user_orig + "_" + supply_orig;
+        auto sid_it = sid_index.find(sid);
+        auto did_it = did_index.find(demand_orig);
+        if (sid_it == sid_index.end() || did_it == did_index.end()) continue;
+        
+        // Compute base score: solution value * heat coefficient
+        double heat_coeff = 1.0;
+        auto user_heat_it = user_supply_heat.find(user_orig);
+        if (user_heat_it != user_supply_heat.end()) {
+            auto supply_heat_it = user_heat_it->second.find(supply_orig);
+            if (supply_heat_it != user_heat_it->second.end()) {
+                heat_coeff = supply_heat_it->second;
+            }
+        }
+        
+        double base_score = x_val * heat_coeff;
+        
+        // Store for demand/supply aggregation
+        std::string did_key = demand_orig;
+        std::string sid_key = sid;
+        demand_continuous_total[did_key] += x_val;
+        supply_continuous_total[sid_key] += x_val;
+        
+        scored_vars.emplace_back(base_score, i, sid_key, did_key);
+    }
+    
+    // Second pass: adjust scores based on relative importance within demand and supply
+    std::vector<std::tuple<double, size_t>> final_scored_indices;
+    
+    for (const auto& [base_score, idx, sid, did] : scored_vars) {
+        double x_val = x[idx];
+        
+        // Compute demand-level importance: higher score for variables that form larger portion of continuous demand
+        double demand_frac = (demand_continuous_total[did] > 1e-9) ? 
+            x_val / demand_continuous_total[did] : 0.0;
+        
+        // Compute supply-level importance: higher score for variables that form larger portion of continuous supply usage
+        double supply_frac = (supply_continuous_total[sid] > 1e-9) ? 
+            x_val / supply_continuous_total[sid] : 0.0;
+        
+        // Combined score: base_score * (1 + demand_importance + supply_importance)
+        // This prioritizes variables that are both individually valuable AND critical to their respective constraints
+        double adjusted_score = base_score * (1.0 + 0.5 * demand_frac + 0.5 * supply_frac);
+        
+        final_scored_indices.emplace_back(adjusted_score, idx);
+    }
+    
+    // Sort by descending adjusted score
+    std::sort(final_scored_indices.begin(), final_scored_indices.end(),
+              [](const std::tuple<double, size_t>& a, const std::tuple<double, size_t>& b) {
+                  return std::get<0>(a) > std::get<0>(b);
+              });
+    
+    // Process in adjusted order with capacity-aware rounding and residual propagation
+    for (const auto& [score, i] : final_scored_indices) {
+        double x_val = x[i];
+        int intended_alloc = static_cast<int>(std::round(x_val));
+        if (intended_alloc <= 0) continue;
+        
+        const std::string &var = var_list[i];
+        std::vector<std::string> parts;
+        std::string var_copy = var;
+        split(var_copy, parts, '_');
+        
+        const std::string user_orig = user_id_convert_rev[parts[1]];
+        const std::string supply_orig = supply_id_convert_rev[parts[2]];
+        const std::string demand_orig = demand_id_convert_rev[parts[3]];
+        
+        std::string sid = user_orig + "_" + supply_orig;
+        auto sid_it = sid_index.find(sid);
+        auto did_it = did_index.find(demand_orig);
+        
+        int sid_idx = sid_it->second;
+        int did_idx = did_it->second;
+        
+        // Determine actual allocation with capacity constraints
+        int actual_alloc = std::min(intended_alloc, sid_remainpv[sid_idx]);
+        actual_alloc = std::min(actual_alloc, did_remain_amount[did_idx]);
+        
+        // Adaptive rounding: if rounding down but significant fractional part remains
+        // and capacity allows, consider rounding up for high-value allocations
+        if (actual_alloc < intended_alloc && actual_alloc == sid_remainpv[sid_idx]) {
+            double frac_part = x_val - std::floor(x_val);
+            if (frac_part > 0.7 && sid_remainpv[sid_idx] > 0) {
+                // Round up if fractional part is large and we have exactly enough supply
+                actual_alloc = std::min(actual_alloc + 1, sid_remainpv[sid_idx]);
+                actual_alloc = std::min(actual_alloc, did_remain_amount[did_idx]);
+            }
+        }
+        
+        if (actual_alloc > 0) {
+            sid_did_allocatepv[sid_idx][did_idx] += actual_alloc;
+            sid_remainpv[sid_idx] -= actual_alloc;
+            did_remain_amount[did_idx] -= actual_alloc;
+        }
+    }
+}
 
     void sls_model::LSout_offline(const std::string& offline_res_file)
     {
@@ -678,44 +786,58 @@ namespace solver
     }
 
     void sls_model::FIFO_online(int cutoff_seconds)
-    {
-        using clock = std::chrono::steady_clock;
-        auto time_start = clock::now();
-        size_t processed_supply = 0;
-        int timed_out = 0;
+{
+    using clock = std::chrono::steady_clock;
+    auto time_start = clock::now();
+    size_t processed_supply = 0;
+    int timed_out = 0;
 
-        for (int sid = 0; sid < static_cast<int>(sid_remainpv.size()); ++sid) {
-            if (++processed_supply % 1000 == 0) {
-                auto now = clock::now();
-                double elapsed = std::chrono::duration<double>(now - time_start).count();
-                if (elapsed > cutoff_seconds) {
-                    std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
-                    timed_out = 1;
-                    break;
-                }
-            }
-            int &remain = sid_remainpv[sid];
-            if (remain <= 0) continue;
-
-            for (int did : sid_did[sid]) {
-                if (did >= static_cast<int>(did_online_mask.size())) continue;
-                if (did_online_mask[did] == 0) continue;
-                int allocate = remain;
-                sid_did_allocatepv[sid][did] += allocate;
-                origin_gain_online += allocate;
-
-                int demand_before = did_remain_amount[did];
-                int actual_satisfied = std::min(allocate, demand_before);
-                did_remain_amount[did] = demand_before - actual_satisfied;
-                remain = 0;
+    for (int sid = 0; sid < static_cast<int>(sid_remainpv.size()); ++sid) {
+        if (++processed_supply % 1000 == 0) {
+            auto now = clock::now();
+            double elapsed = std::chrono::duration<double>(now - time_start).count();
+            if (elapsed > cutoff_seconds) {
+                std::cerr << "[警告] 在线分配达到超时 " << cutoff_seconds << " 秒，已处理 supply 数: " << processed_supply << std::endl;
+                timed_out = 1;
                 break;
             }
         }
+        int &remain = sid_remainpv[sid];
+        if (remain <= 0) continue;
 
-        if (!timed_out) {
-            std::cout << "在线 FIFO 分配完成。" << std::endl;
+        // Collect compatible online demands
+        std::vector<int> eligible_dids;
+        for (int did : sid_did[sid]) {
+            if (did >= static_cast<int>(did_online_mask.size())) continue;
+            if (did_online_mask[did] == 0) continue;
+            eligible_dids.push_back(did);
+        }
+
+        // Sort by descending remaining demand (urgent-first heuristic)
+        std::sort(eligible_dids.begin(), eligible_dids.end(),
+            [&](int a, int b) {
+                return did_remain_amount[a] > did_remain_amount[b];
+            });
+
+        // Process sorted demands until supply exhausted
+        for (int did : eligible_dids) {
+            if (remain <= 0) break;
+            
+            int allocate = std::min(remain, did_remain_amount[did]);
+            if (allocate <= 0) continue;
+            
+            sid_did_allocatepv[sid][did] += allocate;
+            origin_gain_online += allocate;
+
+            did_remain_amount[did] -= allocate;
+            remain -= allocate;
         }
     }
+
+    if (!timed_out) {
+        std::cout << "在线 FIFO 分配完成。" << std::endl;
+    }
+}
 
     void sls_model::LSout_online(const std::string& online_res_file)
     {
