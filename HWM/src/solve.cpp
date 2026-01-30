@@ -345,6 +345,7 @@ namespace solver
             unsatisfied_total = 0;
             for (int rem : did_remain_amount) {
                 unsatisfied_total += rem;
+                std::cout << rem << ",";
             }
             penalty = static_cast<double>(unsatisfied_total) * 1000;
             gain_metric = static_cast<double>(origin_gain_online) - penalty;
@@ -367,6 +368,13 @@ namespace solver
                 is_online[did] = 1;
             }
         }
+        int offline_total_demand = 0;
+        for (size_t did_idx = 0; did_idx < did_amount.size(); ++did_idx) {
+            if (!is_online[did_idx]) {
+                offline_total_demand += did_amount[did_idx];
+            }
+        }
+        std::cout << "离线阶段需求的总原始需求量: " << offline_total_demand << std::endl;
 
         // 1. 计算每个 demand 能关联到的所有 supply 的 pv 总和
         std::vector<std::pair<int, int>> demand_total_pv; // (demand_idx, total_pv)
@@ -438,7 +446,9 @@ namespace solver
                 int alloc = std::min(info.r_i, (int)std::round(info.s_i * alpha));
                 sid_did_allocatepv[info.sid_idx][did_idx] += alloc;
                 sid_remainpv[info.sid_idx] -= alloc;
+                if(sid_remainpv[info.sid_idx]<0) std::cout<<"Error: sid_remainpv negative!"<<std::endl;
                 did_remain_amount[did_idx] -= alloc;
+                if (did_remain_amount[did_idx] < 0) did_remain_amount[did_idx] = 0;
             }
         }
 

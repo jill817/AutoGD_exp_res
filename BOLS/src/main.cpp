@@ -69,6 +69,16 @@ void print_current_obj(MultiObjectiveData& multi_data)
     }
     cout << "unsat supply sum: " << unsat_supply_sum << endl;
 
+    cout << "unsat demand: " << multi_data.unsat_demand << endl;
+    long long unsat_demand_sum = 0;
+    for (auto demand : multi_data.unsat_demand_vec)
+    {
+        unsat_demand_sum += multi_data.demand_remain[demand];
+        cout << demand << " " << multi_data.demand_value[demand] << " "
+                << multi_data.demand_remain[demand] << endl;
+    }
+    cout << "unsat demand sum: " << unsat_demand_sum << endl;
+
     // 重新计算当前assign_supply2demand下的obj1/obj2
     // 1. 计算 query_use/query_use_total
     std::vector<long long> query_use;
@@ -172,7 +182,13 @@ void print_current_assignment(const MultiObjectiveData& multi_data, std::string 
 }
 
 int main(int argc, char** argv) {
+
     util::setRandom(DEFAULT_RANDOM_SEED);
+    // 记录程序开始时间
+    auto program_start_time = std::chrono::system_clock::now();
+    std::time_t program_start_c = std::chrono::system_clock::to_time_t(program_start_time);
+    std::cout << "程序开始运行时间: " << std::put_time(std::localtime(&program_start_c), "%F %T") << std::endl;
+
     TimePoint start_time = util::getTimePoint();
 
     double time_limit = 60;
@@ -357,6 +373,14 @@ int main(int argc, char** argv) {
 
     // cout << "time: " << util::getSeconds(start_time) << " limit " << time_limit << endl;
     // multi_data.hyper_volume();
+
+    // 记录程序结束时间
+    auto program_end_time = std::chrono::system_clock::now();
+    std::time_t program_end_c = std::chrono::system_clock::to_time_t(program_end_time);
+    std::cout << "程序结束运行时间: " << std::put_time(std::localtime(&program_end_c), "%F %T") << std::endl;
+
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(program_end_time - program_start_time).count();
+    std::cout << "程序总运行时长: " << duration << " 秒" << std::endl;
 
     return 0;   
 

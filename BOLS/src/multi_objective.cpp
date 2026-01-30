@@ -42,6 +42,9 @@ void MultiObjectiveData::readDemandFile(string filePath) {
         assert(demand_value.size() == demand_cnt);
     }
     fileStream.close();
+    long long total_demand = 0;
+    for (const auto& val : demand_value) total_demand += val;
+    std::cout << "总原始需求量: " << total_demand << std::endl;
 }
 
 void MultiObjectiveData::readSampleFile(string filePath) {

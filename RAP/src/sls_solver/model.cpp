@@ -57,7 +57,7 @@ namespace solver
         }
     }
 
-    sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set) : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set), online_top_k(1) {}
+    sls_model::sls_model(std::string integer_set, std::string demand_set, std::string heat_set) : format_supply_path(integer_set), demand_path(demand_set), heat_path(heat_set) {}
 
     void sls_model::read_demand_data()
     {
@@ -79,6 +79,12 @@ namespace solver
         }
         std::cout << "demand data size: " << demand_id_amount.size() << std::endl;
         demand_file.close();
+        long long total_demand = 0;
+        for (const auto& pair : demand_id_amount) {
+            total_demand += pair.second;
+        }
+
+        std::cout << "总原始需求量: " << total_demand << std::endl;
     }
 
     void sls_model::read_heat_data()
@@ -164,7 +170,7 @@ namespace solver
      */
     void sls_model::model_problem(std::string lp_file, std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit, int online_top_k)
     {
-        (void)online_top_k; // online_top_k stored on model; here for signature consistency
+        // (void)online_top_k; // online_top_k stored on model; here for signature consistency
         std::cout << "user num | supply num | demand num\n";
         std::cout << user_supply_cast_times.size() << " | " << supply_demand_set.size() << " | " << demand_id_amount.size() << std::endl;
         
@@ -485,7 +491,7 @@ namespace solver
 
     void sls_model::solve_problem(std::string lp_file,std::string output_base, int nia_num, std::string result_file, ModelMode mode,int time_limit, int online_top_k)
     {
-        this->online_top_k = online_top_k;
+        // this->online_top_k = online_top_k;
         read_demand_data();
         read_integer_data();
         read_heat_data();
@@ -580,7 +586,7 @@ namespace solver
         }
     }
 
-    std::vector<std::string> sls_model::choose_online_demand_ids() const
+    std::vector<std::string> sls_model::choose_online_demand_ids(int online_top_k) const
     {
         std::vector<std::string> targets;
         if (online_top_k <= 0) {
@@ -597,10 +603,10 @@ namespace solver
         return targets;
     }
 
-    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x)
+    void sls_model::map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x, int online_top_k)
     {
         reset_allocation_state();
-        std::vector<std::string> online_targets = choose_online_demand_ids();
+        std::vector<std::string> online_targets = choose_online_demand_ids(online_top_k);
         std::unordered_set<std::string> online_target_set(online_targets.begin(), online_targets.end());
         for (size_t i = 0; i < var_list.size() && i < x.size(); ++i) {
             int alloc = static_cast<int>(std::round(x[i]));
@@ -650,10 +656,10 @@ namespace solver
         std::cout << "分配方案已输出到: " << offline_res_file << std::endl;
     }
 
-    void sls_model::mark_fixed_online_demand()
+    void sls_model::mark_fixed_online_demand(int online_top_k)
     {
         did_online_mask.assign(did_index.size(), 0);
-        std::vector<std::string> targets = choose_online_demand_ids();
+        std::vector<std::string> targets = choose_online_demand_ids(online_top_k);
         for (const auto& target : targets) {
             if (did_index.count(target)) {
                 did_online_mask[did_index[target]] = 1;
@@ -751,11 +757,37 @@ namespace solver
         // std::cout<< "test1"<<std::endl;
     }
 
+    void sls_model::compute_and_log_offline_demand_totals(int online_top_k) const
+    {
+        std::vector<std::string> online_targets = choose_online_demand_ids(online_top_k);
+        std::unordered_set<std::string> online_set(online_targets.begin(), online_targets.end());
+
+        long long offline_total = 0;           // 所有非 online demand 的需求总量（不要求出现在 supply）
+        long long offline_total_effective = 0; // 所有非 online 且出现在 supply(did_index) 的需求总量
+
+        for (const auto &kv : demand_id_amount) {
+            const std::string &did = kv.first;
+            int amount = kv.second;
+            if (!online_set.empty() && online_set.count(did)) {
+                continue;
+            }
+            offline_total += static_cast<long long>(amount);
+            if (did_index.count(did)) {
+                offline_total_effective += static_cast<long long>(amount);
+            }
+        }
+
+        std::cout << "Offline demand totals (exclude online_top_k=" << online_top_k << "): "
+                  << "offline_total=" << offline_total
+                  << ", offline_total_effective=" << offline_total_effective
+                  << std::endl;
+    }
+
 
 
     void sls_model::solve_with_rap_from_model(const solver::opt_solver& solver, const std::string& output_base, ModelMode mode, const std::chrono::steady_clock::time_point& start_time, int time_limit, int online_top_k)
     {
-        (void)online_top_k; // already stored in member in solve_problem
+        // (void)online_top_k; // already stored in member in solve_problem
         const double alpha0 = 0.00001;
         const double tol = 1e-6;
         const double inf_bound = 1e8;
@@ -891,7 +923,7 @@ namespace solver
                 double viol = std::max(0.0, -s_ineq[i]);
                 if (viol > max_ineq_viol) max_ineq_viol = viol;
             }
-            if (t % 1000 == 0) {
+            if (t % 10 == 0) {
                 double quad = 0.0;
                 for (int j = 0; j < n; ++j) quad += w[j] * x[j] * x[j];
                 double obj = 0.5 * quad;
@@ -912,11 +944,12 @@ namespace solver
             }
         }
         // 输出离线结果并进入在线阶段
-        map_solution_to_allocation(var_list, x);
+        map_solution_to_allocation(var_list, x,online_top_k);
         std::string offline_csv = output_base + "_offline.csv";
         LSout_offline(offline_csv);
 
-        mark_fixed_online_demand();
+        mark_fixed_online_demand(online_top_k);
+        compute_and_log_offline_demand_totals(online_top_k);
         FIFO_online(time_limit);
         std::string online_csv = output_base + "_online.csv";
         LSout_online(online_csv);

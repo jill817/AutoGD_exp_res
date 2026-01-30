@@ -59,6 +59,12 @@ namespace solver
         }
         std::cout << "demand data size: " << demand_id_amount.size() << std::endl;
         demand_file.close();
+        long long total_demand = 0;
+        for (const auto& pair : demand_id_amount) {
+            total_demand += pair.second;
+        }
+
+        std::cout << "总原始需求量: " << total_demand << std::endl;
     }
 
     void sls_model::read_heat_data()

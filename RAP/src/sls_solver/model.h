@@ -60,7 +60,7 @@ namespace solver {
         std::vector<int> did_online_mask;                         // 在线需求标记
         std::string last_valid_demand_id;                         // 记录在 demand 文件中出现的最后一个有效需求
         std::vector<std::string> demand_read_order;               // 记录 demand 读取顺序，便于确定 online 需求
-        int online_top_k;                                         // 在线阶段保留的需求数量
+        // int online_top_k;                                         // 在线阶段保留的需求数量
         long long origin_gain_online = 0;
         long long unsatisfied_total = 0;
         double penalty = 0.0;
@@ -78,13 +78,14 @@ namespace solver {
         // 离线解到在线阶段的准备与输出
         void init_allocation_state();
         void reset_allocation_state();
-        void map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x);
+        void map_solution_to_allocation(const std::vector<std::string>& var_list, const std::vector<double>& x,int online_top_k);
         void LSout_offline(const std::string& offline_res_file);
-        void mark_fixed_online_demand();
+        void mark_fixed_online_demand(int online_top_k);
         void FIFO_online(int cutoff_seconds);
         void LSout_online(const std::string& online_res_file);
         void compute_and_log_online_metrics();
-        std::vector<std::string> choose_online_demand_ids() const;
+        void compute_and_log_offline_demand_totals(int online_top_k) const;
+        std::vector<std::string> choose_online_demand_ids(int online_top_k) const;
     public:
         sls_model(std::string integer_set, std::string demand_set, std::string heat_set);
         void solve_problem(std::string lp_file,std::string sol_path, int nia_num, std::string, ModelMode mode,int time_limit, int online_top_k);
