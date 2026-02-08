@@ -331,47 +331,47 @@ namespace solver
 
         LocalSearch(allocation_res_file, mode);
 
-        // local search 结束时间
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         std::cout << "Local search function execution time: " << duration << " ms" << std::endl;
-        
-        // 在线阶段：读取在线需求、FIFO分配、输出在线结果（包含离线+在线）
-        std::string online_allocation_res_file = allocation_res_file + "_online.csv";
-        mark_fixed_online_demand();
-        
-        // Enhancement: Sort online demands by remaining amount (descending) before FIFO allocation
-        // This prioritizes larger remaining demands during online allocation
-        std::vector<std::pair<int, int>> online_demand_priority; // (demand_idx, remaining_amount)
-        for (int did : last_online_list) {
-            if (did >= 0 && did < (int)did_remain_amount.size()) {
-                online_demand_priority.emplace_back(did, did_remain_amount[did]);
+
+        // Optimize online demand ordering using remaining amount and supply scarcity
+        {
+            std::vector<std::tuple<int, int, int>> online_demands; // (demand_idx, remaining_amount, supply_count)
+            for (int did : last_online_list) {
+                if (did_remain_amount[did] > 0) {
+                    int supply_count = did_sid[did].size();
+                    online_demands.emplace_back(did, did_remain_amount[did], supply_count);
+                }
+            }
+            
+            // Sort by: 1) Remaining amount (descending) 2) Number of available supplies (ascending)
+            // Prioritizes large demands that are harder to satisfy (fewer supply options)
+            std::sort(online_demands.begin(), online_demands.end(), 
+                [](const auto& a, const auto& b) {
+                    if (std::get<1>(a) != std::get<1>(b))
+                        return std::get<1>(a) > std::get<1>(b); // Higher remaining first
+                    return std::get<2>(a) < std::get<2>(b);     // Fewer supplies first
+                });
+            
+            last_online_list.clear();
+            last_online_idlist.clear();
+            for (const auto& tup : online_demands) {
+                int did = std::get<0>(tup);
+                last_online_list.push_back(did);
+                last_online_idlist.push_back(index_did[did]);
             }
         }
-        
-        // Sort by remaining amount in descending order
-        std::sort(online_demand_priority.begin(), online_demand_priority.end(),
-                 [](const auto& a, const auto& b) {
-                     return a.second > b.second; // Higher remaining amount first
-                 });
-        
-        // Create sorted online list
-        std::vector<int> sorted_online_list;
-        for (const auto& item : online_demand_priority) {
-            sorted_online_list.push_back(item.first);
-        }
-        
-        // Temporary swap for sorted allocation
-        std::swap(last_online_list, sorted_online_list);
+
+        std::string online_allocation_res_file = allocation_res_file + "_online.csv";
+        mark_fixed_online_demand();
         FIFO_online(cutoff_seconds);
-        std::swap(last_online_list, sorted_online_list); // Restore original order
-        
         LSout_online(online_allocation_res_file);
 
-        // compute online metrics (gain/penalty) and print
         unsatisfied_total = 0;
         for (int rem : did_remain_amount) {
             unsatisfied_total += rem;
+            std::cout << rem << ",";
         }
         penalty = static_cast<double>(unsatisfied_total) * 1000;
         gain_metric = static_cast<double>(origin_gain_online) - penalty;

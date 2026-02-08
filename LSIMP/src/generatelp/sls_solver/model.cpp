@@ -97,17 +97,17 @@ namespace solver
     }
 
 
-    void sls_model::read_integer_data()
+    void sls_model::read_supply_data()
     {
         user_supply_cast_times.clear();
         user_supply_demand_set.clear();
         supply_user_demand_set.clear();
         supply_demand_set.clear();
         supply_with_more_demand.clear();
-        std::ifstream integer_file(format_supply_path);
+        std::ifstream supply_file(format_supply_path);
         std::string record;
         // user`supply`demand1,demand2
-        while (getline(integer_file, record))
+        while (getline(supply_file, record))
         {
             // only read ?%
             // if (rand() % 10000 < 5000)
@@ -142,7 +142,7 @@ namespace solver
                 supply_with_more_demand.insert(ele.first);
             }
         }
-        integer_file.close();
+        supply_file.close();
     }
 
     /**
@@ -649,7 +649,7 @@ namespace solver
     void sls_model::solve_problem(std::string lp_file, int nia_num, std::string result_file, ModelMode mode)
     {
         read_demand_data();
-        read_integer_data();
+        read_supply_data();
         read_heat_data();
         generate_id_convert();
         model_problem(lp_file, nia_num, result_file,mode);

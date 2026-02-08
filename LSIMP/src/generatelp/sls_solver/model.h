@@ -51,7 +51,7 @@ namespace solver {
 
         void read_demand_data();
         void read_heat_data();
-        void read_integer_data();
+        void read_supply_data();
         void generate_id_convert();
         void model_problem(std::string str, int nia_num, std::string, ModelMode mode);
     public:
